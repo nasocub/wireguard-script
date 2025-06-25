@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Current script version number
-VERSION='1.0.15' # Version updated to fix critical syntax error from non-standard whitespace
+VERSION='1.0.16' # Version updated with improved error logging for service startup
 
 # Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
@@ -44,7 +44,7 @@ check_operating_system() {
   PACKAGE_UNINSTALL=("apt -y autoremove" "apt -y autoremove" "yum -y autoremove" "apk del -f" "pacman -Rcnsu --noconfirm" "dnf -y autoremove")
   SYSTEMCTL_START=("systemctl start wg-quick@wg0" "systemctl start wg-quick@wg0" "systemctl start wg-quick@wg0" "wg-quick up wg0" "systemctl start wg-quick@wg0" "systemctl start wg-quick@wg0")
   SYSTEMCTL_RESTART=("systemctl restart wg-quick@wg0" "systemctl restart wg-quick@wg0" "systemctl restart wg-quick@wg0" "alpine_wg_restart" "systemctl restart wg-quick@wg0" "systemctl restart wg-quick@wg0")
-  SYSTEMCTL_ENABLE=("systemctl enable --now wg-quick@wg0" "systemctl enable --now wg-quick@wg0" "systemctl enable --now wg-quick@wg0" "alpine_wg_enable" "systemctl enable --now wg-quick@wg0" "systemctl enable --now wg-quick@wg0")
+  SYSTEMCTL_ENABLE=("systemctl enable wg-quick@wg0" "systemctl enable wg-quick@wg0" "systemctl enable wg-quick@wg0" "alpine_wg_enable" "systemctl enable wg-quick@wg0" "systemctl enable wg-quick@wg0")
 
   for int in "${!REGEX[@]}"; do
     [[ "${SYS,,}" =~ ${REGEX[int]} ]] && SYSTEM="${RELEASE[int]}" && break
@@ -57,7 +57,7 @@ check_operating_system() {
 
   # Alpine specific functions
   alpine_wg_restart() { wg-quick down wg0 >/dev/null 2>&1; wg-quick up wg0 >/dev/null 2>&1; }
-  alpine_wg_enable() { echo -e "wg-quick up wg0" > /etc/local.d/wg0.start; chmod +x /etc/local.d/wg0.start; rc-update add local; wg-quick up wg0 >/dev/null 2>&1; }
+  alpine_wg_enable() { echo -e "wg-quick up wg0" > /etc/local.d/wg0.start; chmod +x /etc/local.d/wg0.start; rc-update add local; }
 }
 
 # Install system dependencies
@@ -610,8 +610,22 @@ EOF
 
   info "WireGuard startup/shutdown scripts created: /etc/wireguard/wg0_up.sh and /etc/wireguard/wg0_down.sh"
 
-  # Enable and start WireGuard service
-  ${SYSTEMCTL_ENABLE[int]} >/dev/null 2>&1 || error "Failed to enable and start WireGuard service, please check logs."
+  # Enable and start WireGuard service with better error reporting
+  info "Enabling WireGuard to start on boot..."
+  ${SYSTEMCTL_ENABLE[int]} >/dev/null 2>&1 || warning "Failed to enable WireGuard service for boot. It may not start automatically."
+
+  info "Starting WireGuard service... (This may take a moment)"
+  # Start the service with verbose output to diagnose PostUp script issues.
+  # The redirection to /dev/null is removed to make errors visible.
+  if ! ${SYSTEMCTL_START[int]}; then
+      echo # Newline for better formatting
+      warning "----------------------------------------------------------------"
+      warning "WireGuard service failed to start."
+      warning "This is often due to an error in the PostUp script."
+      info "To diagnose, run the following command and check for errors:"
+      hint "  journalctl -u wg-quick@wg0 --no-pager | tail -n 50"
+      error "Script aborted. Please review the logs to fix the issue."
+  fi
 
   info "\n--- Custom WireGuard VPN installed successfully! ---"
   get_status
