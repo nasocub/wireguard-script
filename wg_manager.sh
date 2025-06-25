@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Current script version number
-VERSION='1.0.11' # Version updated for IPv6 debugging and robustness improvements
+VERSION='1.0.12' # Version updated for typo fix and continued IPv6 debugging
 
 # Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
@@ -266,7 +266,7 @@ EOF
       echo "AllowedIPs = ::/0" >> /etc/wireguard/wg0.conf
   fi
 
-  [ -n "$PRESHARED_KEY" ] && echo "PresharedKey = $PRESHARED_K`EY" >> /etc/wireguard/wg0.conf
+  [ -n "$PRESHARED_KEY" ] && echo "PresharedKey = $PRESHARED_KEY" >> /etc/wireguard/wg0.conf
   [ -n "$PERSISTENT_KEEPALIVE" ] && echo "PersistentKeepalive = $PERSISTENT_KEEPALIVE" >> /etc/wireguard/wg0.conf
 
   chmod 600 /etc/wireguard/wg0.conf
@@ -706,6 +706,7 @@ uninstall_wireguard() {
         sudo apt autoremove --purge openresolv -y >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v yum >/dev/null || command -v dnf >/dev/null; then
         sudo yum autoremove openresolv -y >/dev/null 2>&1 || sudo dnf autoremove openresolv -y >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
+    对了，我在 `wg0_up.sh` 和 `wg0_down.sh` 脚本中默认启用了 `set -x`。这将提供非常详细的执行日志，帮助我们追踪每一步命令的执行情况。请运行更新后的脚本，并在出现问题时提供这些日志的完整输出，这将是解决 IPv6 问题的关键。
     elif command -v apk >/dev/null; then
         sudo apk del openresolv >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v pacman >/dev/null; then
