@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 
-# 当前脚本版本号
-VERSION='1.0.10' # 版本号更新，修复卸载时UFW端口清理问题
+# Current script version number
+VERSION='1.0.10' # Version updated, fixed UFW port cleanup issue during uninstallation
 
-# 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
+# Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
 
-# --- 脚本内部工具函数 ---
+# --- Script Internal Utility Functions ---
 
-# 自定义字体彩色
-warning() { echo -e "\033[31m\033[01m$*\033[0m"; }  # 红色
-error() { echo -e "\033[31m\033[01m$*\033[0m" && exit 1; }  # 红色
-info() { echo -e "\033[32m\033[01m$*\033[0m"; }    # 绿色
-hint() { echo -e "\033[33m\033[01m$*\033[0m"; }    # 黄色
+# Custom font colors
+warning() { echo -e "\033[31m\033[01m$*\033[0m"; } # Red
+error() { echo -e "\033[31m\033[01m$*\033[0m" && exit 1; } # Red, and exit
+info() { echo -e "\033[32m\033[01m$*\033[0m"; } # Green
+hint() { echo -e "\033[33m\033[01m$*\033[0m"; } # Yellow
 reading() { read -rp "$(info "$1")" "$2"; }
 
-# 确保以root权限运行
+# Ensure script runs with root privileges
 check_root() {
-  [ "$(id -u)" != 0 ] && error "此脚本必须以root权限运行。请使用 sudo -i 后再次运行。"
+  [ "$(id -u)" != 0 ] && error "This script must be run with root privileges. Please use sudo -i and run again."
 }
 
-# 检查操作系统
+# Check operating system
 check_operating_system() {
   if [ -s /etc/os-release ]; then
     SYS="$(grep -i pretty_name /etc/os-release | cut -d \" -f2)"
@@ -38,7 +38,7 @@ check_operating_system() {
 
   REGEX=("debian" "ubuntu" "centos|red hat|kernel|alma|rocky" "alpine" "arch linux" "fedora")
   RELEASE=("Debian" "Ubuntu" "CentOS" "Alpine" "Arch" "Fedora")
-  MAJOR=("9" "16" "7" "" "" "37") # 最低支持版本
+  MAJOR=("9" "16" "7" "" "" "37") # Minimum supported version
   PACKAGE_UPDATE=("apt -y update" "apt -y update" "yum -y update --skip-broken" "apk update -f" "pacman -Sy" "dnf -y update")
   PACKAGE_INSTALL=("apt -y install" "apt -y install" "yum -y install" "apk add -f" "pacman -S --noconfirm" "dnf -y install")
   PACKAGE_UNINSTALL=("apt -y autoremove" "apt -y autoremove" "yum -y autoremove" "apk del -f" "pacman -Rcnsu --noconfirm" "dnf -y autoremove")
@@ -50,19 +50,19 @@ check_operating_system() {
     [[ "${SYS,,}" =~ ${REGEX[int]} ]] && SYSTEM="${RELEASE[int]}" && break
   done
 
-  [ -z "$SYSTEM" ] && error "不支持的操作系统: $SYS。脚本中止。"
+  [ -z "$SYSTEM" ] && error "Unsupported operating system: $SYS. Script aborted."
 
   MAJOR_VERSION=$(sed "s/[^0-9.]//g" <<< "$SYS" | cut -d. -f1)
-  [ -n "${MAJOR[int]}" ] && [[ "$MAJOR_VERSION" -lt "${MAJOR[int]}" ]] && error "当前操作系统 ${SYS} 不支持，要求版本高于 ${RELEASE[int]} ${MAJOR[int]}。"
+  [ -n "${MAJOR[int]}" ] && [[ "$MAJOR_VERSION" -lt "${MAJOR[int]}" ]] && error "Current operating system ${SYS} is not supported. Version required: ${RELEASE[int]} ${MAJOR[int]} or higher."
 
   # Alpine specific functions
   alpine_wg_restart() { wg-quick down wg0 >/dev/null 2>&1; wg-quick up wg0 >/dev/null 2>&1; }
   alpine_wg_enable() { echo -e "wg-quick up wg0" > /etc/local.d/wg0.start; chmod +x /etc/local.d/wg0.start; rc-update add local; wg-quick up wg0 >/dev/null 2>&1; }
 }
 
-# 安装系统依赖
+# Install system dependencies
 check_dependencies() {
-  info "\n检查并安装系统依赖..."
+  info "\nChecking and installing system dependencies..."
 
   if [ "$SYSTEM" = 'Alpine' ]; then
     DEPS_CHECK=("ping" "curl" "grep" "bash" "ip" "wget" "resolvconf" "iptables" "ip6tables") # Add iptables/ip6tables check
@@ -85,54 +85,54 @@ check_dependencies() {
   done
 
   if [ "${#DEPS_TO_INSTALL[@]}" -ge 1 ]; then
-    info "正在安装以下依赖: ${DEPS_TO_INSTALL[@]}"
-    ${PACKAGE_UPDATE[int]} >/dev/null 2>&1 || warning "更新软件包列表失败，尝试继续安装依赖。"
-    ${PACKAGE_INSTALL[int]} ${DEPS_TO_INSTALL[@]} >/dev/null 2>&1 || error "安装依赖失败，脚本中止。"
+    info "Installing the following dependencies: ${DEPS_TO_INSTALL[@]}"
+    ${PACKAGE_UPDATE[int]} >/dev/null 2>&1 || warning "Failed to update package list, attempting to continue installing dependencies."
+    ${PACKAGE_INSTALL[int]} "${DEPS_TO_INSTALL[@]}" >/dev/null 2>&1 || error "Failed to install dependencies, script aborted."
   else
-    info "所有依赖已存在，无需额外安装。"
+    info "All dependencies already exist, no additional installation needed."
   fi
 
-  # 安装 wireguard-tools
+  # Install wireguard-tools
   if [ ! -x "$(type -p wg)" ]; then
-    info "安装 wireguard-tools..."
+    info "Installing wireguard-tools..."
     case "$SYSTEM" in
       Debian )
-        local DEBIAN_VERSION=$(echo $SYS | sed "s/[^0-9.]//g" | cut -d. -f1)
-        if [ "$DEBIAN_VERSION" -lt 11 ]; then # Debian 9/10 需要 backports
+        local DEBIAN_VERSION=$(echo "$SYS" | sed "s/[^0-9.]//g" | cut -d. -f1)
+        if [ "$DEBIAN_VERSION" -lt 11 ]; then # Debian 9/10 needs backports
           echo "deb http://deb.debian.org/debian $(awk -F '=' '/VERSION_CODENAME/{print $2}' /etc/os-release)-backports main" > /etc/apt/sources.list.d/backports.list
           ${PACKAGE_UPDATE[int]} >/dev/null 2>&1
         fi
-        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools 安装失败。"
+        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools installation failed."
         ;;
       Ubuntu )
-        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools 安装失败。"
+        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools installation failed."
         ;;
       CentOS|Fedora )
         [ "$SYSTEM" = 'CentOS' ] && ${PACKAGE_INSTALL[int]} epel-release >/dev/null 2>&1
-        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools 安装失败。"
+        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools installation failed."
         ;;
       Alpine )
-        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools 安装失败。"
+        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools installation failed."
         ;;
       Arch )
-        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools 安装失败。"
+        ${PACKAGE_INSTALL[int]} wireguard-tools || error "wireguard-tools installation failed."
         ;;
       * )
-        error "无法为当前操作系统安装 wireguard-tools，请手动安装。"
+        error "Cannot install wireguard-tools for the current operating system, please install manually."
     esac
   fi
 
-  # 确保防火墙规则持久化工具安装
+  # Ensure firewall rule persistence tool is installed
   if [ "$SYSTEM" = 'Debian' ] || [ "$SYSTEM" = 'Ubuntu' ]; then
     if ! dpkg -s netfilter-persistent >/dev/null 2>&1; then
-      info "安装 netfilter-persistent 以保存防火墙规则..."
-      ${PACKAGE_INSTALL[int]} netfilter-persistent >/dev/null 2>&1 || warning "netfilter-persistent 安装失败，防火墙规则可能无法持久化。"
-      systemctl enable netfilter-persistent >/dev/null 2>&1 || warning "启用 netfilter-persistent 失败。"
+      info "Installing netfilter-persistent to save firewall rules..."
+      ${PACKAGE_INSTALL[int]} netfilter-persistent >/dev/null 2>&1 || warning "netfilter-persistent installation failed, firewall rules may not persist."
+      systemctl enable netfilter-persistent >/dev/null 2>&1 || warning "Failed to enable netfilter-persistent."
     fi
   elif [ "$SYSTEM" = 'CentOS' ] || [ "$SYSTEM" = 'Fedora' ]; then
     if ! rpm -q iptables-services >/dev/null 2>&1; then
-      info "安装 iptables-services 以保存防火墙规则..."
-      ${PACKAGE_INSTALL[int]} iptables-services >/dev/null 2>&1 || warning "iptables-services 安装失败，防火墙规则可能无法持久化。"
+      info "Installing iptables-services to save firewall rules..."
+      ${PACKAGE_INSTALL[int]} iptables-services >/dev/null 2>&1 || warning "iptables-services installation failed, firewall rules may not persist."
       systemctl enable iptables >/dev/null 2>&1
       systemctl enable ip6tables >/dev/null 2>&1
     fi
@@ -141,7 +141,7 @@ check_dependencies() {
   PING6='ping -6' && [ -x "$(type -p ping6)" ] && PING6='ping6'
 }
 
-# 获取服务器当前公网 IP，优先通过路由表获取
+# Get server's current public IP, prioritizing routing table
 get_public_ips() {
     # Get the source IP that would be used for reaching a well-known public IPv4 address
     PUBLIC_V4=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}$')
@@ -158,74 +158,73 @@ get_public_ips() {
 }
 
 
-# 获取 WireGuard 接口的 IP (在激活后)
+# Get WireGuard interface IPs (after activation)
 get_wg_interface_ips() {
     WG_LOCAL_V4=$(ip addr show wg0 | grep "inet\b" | awk '{print $2}' | cut -d / -f 1 | head -n 1)
     WG_LOCAL_V6=$(ip addr show wg0 | grep "inet6\b" | awk '{print $2}' | cut -d / -f 1 | head -n 1)
 }
 
-# 安装自定义 WireGuard VPN
+# Install custom WireGuard VPN
 install_custom_wireguard() {
-  info "\n--- 安装自定义 WireGuard VPN ---"
+  info "\n--- Installing Custom WireGuard VPN ---"
 
-  [ -e /etc/wireguard/wg0.conf ] && warning "已检测到现有 WireGuard 配置 (/etc/wireguard/wg0.conf)。请先卸载旧配置或备份。" && return
+  [ -e /etc/wireguard/wg0.conf ] && warning "Existing WireGuard configuration detected (/etc/wireguard/wg0.conf). Please uninstall old config or back it up first." && return
 
-  # 收集用户输入
-  reading "请输入您的 WireGuard 私钥 (PrivateKey): " PRIVATE_KEY
-  [ -z "$PRIVATE_KEY" ] && error "私钥不能为空！"
+  # Collect user input
+  reading "Please enter your WireGuard Private Key (PrivateKey): " PRIVATE_KEY
+  [ -z "$PRIVATE_KEY" ] && error "Private key cannot be empty!"
 
-  reading "请输入您的 WireGuard IPv4 地址 (例如: 10.0.0.2/24): " CUSTOM_IPV4_ADDRESS
-  [ -z "$CUSTOM_IPV4_ADDRESS" ] && error "IPv4 地址不能为空！"
+  reading "Please enter your WireGuard IPv4 address (e.g.: 10.0.0.2/24): " CUSTOM_IPV4_ADDRESS
+  [ -z "$CUSTOM_IPV4_ADDRESS" ] && error "IPv4 address cannot be empty!"
 
-  reading "请输入您的 WireGuard IPv6 地址 (可选，例如: fc00::2/64): " CUSTOM_IPV6_ADDRESS
+  reading "Please enter your WireGuard IPv6 address (Optional, e.g.: fc00::2/64): " CUSTOM_IPV6_ADDRESS
 
-  reading "请输入对端公钥 (Peer PublicKey): " PEER_PUBLIC_KEY
-  [ -z "$PEER_PUBLIC_KEY" ] && error "对端公钥不能为空！"
+  reading "Please enter Peer Public Key (Peer PublicKey): " PEER_PUBLIC_KEY
+  [ -z "$PEER_PUBLIC_KEY" ] && error "Peer public key cannot be empty!"
 
-  reading "请输入对端端点 (Endpoint, 例如: vpn.example.com:51820): " ENDPOINT
-  [ -z "$ENDPOINT" ] && error "端点不能为空！"
+  reading "Please enter Peer Endpoint (e.g.: vpn.example.com:51820): " ENDPOINT
+  [ -z "$ENDPOINT" ] && error "Endpoint cannot be empty!"
 
-  reading "请输入预共享密钥 (PresharedKey, 可选，留空则不使用): " PRESHARED_KEY
+  reading "Please enter PresharedKey (Optional, leave blank to not use): " PRESHARED_KEY
 
-  reading "请输入持久连接间隔 (PersistentKeepalive, 可选，秒，留空则不使用): " PERSISTENT_KEEPALIVE
+  reading "Please enter PersistentKeepalive (Optional, seconds, leave blank to not use): " PERSISTENT_KEEPALIVE
 
-  reading "请输入 WireGuard MTU 值 (可选，推荐 1420，留空则不设置): " CUSTOM_MTU
+  reading "Please enter WireGuard MTU value (Optional, recommended 1420, leave blank to not set): " CUSTOM_MTU
 
-  # 启用 IP 转发功能
-  info "启用 IP 转发功能..."
-  # 启用 IPv4 转发
+  # Enable IP forwarding
+  info "Enabling IP forwarding..."
+  # Enable IPv4 forwarding
   echo "net.ipv4.ip_forward = 1" | tee /etc/sysctl.d/99-wireguard-forwarding.conf > /dev/null
-  # 如果检测到原生 IPv6，则启用 IPv6 转发
+  # If native IPv6 detected, enable IPv6 forwarding
   if [ -n "$PUBLIC_V6" ]; then
       echo "net.ipv6.conf.all.forwarding = 1" | tee -a /etc/sysctl.d/99-wireguard-forwarding.conf > /dev/null
       echo "net.ipv6.conf.default.forwarding = 1" | tee -a /etc/sysctl.d/99-wireguard-forwarding.conf > /dev/null
-      info "IPv6 转发已启用并设置为开机启动。"
+      info "IPv6 forwarding enabled and set to start on boot."
   else
-      warning "未检测到原生公共 IPv6 地址，跳过 IPv6 转发配置。"
+      warning "No native public IPv6 address detected, skipping IPv6 forwarding configuration."
   fi
-  sysctl -p /etc/sysctl.d/99-wireguard-forwarding.conf >/dev/null 2>&1 || warning "应用 sysctl 配置失败，请手动检查 /etc/sysctl.d/99-wireguard-forwarding.conf。"
+  sysctl -p /etc/sysctl.d/99-wireguard-forwarding.conf >/dev/null 2>&1 || warning "Failed to apply sysctl configuration, please manually check /etc/sysctl.d/99-wireguard-forwarding.conf."
 
 
-  # 处理 UFW 防火墙规则
+  # Handle UFW firewall rules
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-      info "检测到 UFW 处于活动状态，正在配置 UFW 规则..."
-      # 允许 WireGuard 接口的流量转发
+      info "UFW detected and active, configuring UFW rules..."
+      # Allow traffic forwarding on WireGuard interface
       ufw allow in on wg0 comment 'Allow WireGuard inbound traffic'
       ufw allow out on wg0 comment 'Allow WireGuard outbound traffic'
-      # 允许 WireGuard 端口 UDP 流量
-      # 此处假设 WireGuard 监听端口为 51820 (如果您配置了不同的端口，请修改)
+      # Allow WireGuard UDP traffic on the specified port
       local ENDPOINT_PORT=$(echo "$ENDPOINT" | awk -F':' '{print $NF}')
-      ufw allow $ENDPOINT_PORT/udp comment "Allow WireGuard UDP traffic"
-      # 允许转发策略从 DROP 改为 ACCEPT (如果默认是 DROP)
+      ufw allow "$ENDPOINT_PORT"/udp comment "Allow WireGuard UDP traffic"
+      # Change forwarding policy from DROP to ACCEPT (if default is DROP)
       sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-      ufw reload >/dev/null 2>&1 || warning "UFW 重载失败，请手动检查。"
-      info "UFW 规则已配置。请注意，如果您之前有其他严格的 UFW 规则，可能需要手动调整以允许相关流量。"
+      ufw reload >/dev/null 2>&1 || warning "UFW reload failed, please check manually."
+      info "UFW rules configured. Note: If you had other strict UFW rules, you might need to adjust them manually to allow relevant traffic."
   else
-      info "未检测到 UFW 或 UFW 未启用，跳过 UFW 配置。"
+    info "UFW not detected or not enabled, skipping UFW configuration."
   fi
 
 
-  # 创建 WireGuard 配置文件
+  # Create WireGuard configuration file
   mkdir -p /etc/wireguard/
 
   cat > /etc/wireguard/wg0.conf <<EOF
@@ -234,25 +233,25 @@ PrivateKey = $PRIVATE_KEY
 Address = $CUSTOM_IPV4_ADDRESS
 EOF
 
-  # 只有当用户输入了 IPv6 地址且 VPS 本身有原生 IPv6 时，才将 IPv6 地址写入配置
+  # Only write IPv6 address to config if user entered one AND VPS has native IPv6
   if [ -n "$CUSTOM_IPV6_ADDRESS" ] && [ -n "$PUBLIC_V6" ]; then
       echo "Address = $CUSTOM_IPV6_ADDRESS" >> /etc/wireguard/wg0.conf
-      info "VPS 检测到原生 IPv6。WireGuard IPv6 地址已写入配置。"
+      info "VPS detected native IPv6. WireGuard IPv6 address written to config."
   elif [ -n "$CUSTOM_IPV6_ADDRESS" ]; then
-      warning "VPS 未检测到原生 IPv6。WireGuard IPv6 地址将被忽略以防止启动错误。"
+      warning "VPS did not detect native public IPv6. WireGuard IPv6 address will be ignored to prevent startup errors."
   fi
 
-  # 使用公共 DNS 服务
+  # Use public DNS services
   echo "DNS = 1.1.1.1, 8.8.8.8, 2606:4700:4700::1111, 2001:4860:4860::8888" >> /etc/wireguard/wg0.conf
 
-  # 设置 WireGuard 接口的 MTU
+  # Set WireGuard interface MTU
   [ -n "$CUSTOM_MTU" ] && echo "MTU = $CUSTOM_MTU" >> /etc/wireguard/wg0.conf
 
-  # 配置 PostUp/PostDown 脚本以实现选择性路由
-  # 目标：入站流量和来自本地服务的出站流量不受影响，其他出站流量走 WireGuard。
+  # Configure PostUp/PostDown scripts for selective routing
+  # Goal: Inbound traffic and outbound traffic from local services are unaffected, other outbound traffic goes through WireGuard.
   echo "PostUp = /etc/wireguard/wg0_up.sh" >> /etc/wireguard/wg0.conf
   echo "PostDown = /etc/wireguard/wg0_down.sh" >> /etc/wireguard/wg0.conf
-  echo "Table = off" >> /etc/wireguard/wg0.conf # 不直接修改主路由表，而是通过 PostUp/PostDown 管理
+  echo "Table = off" >> /etc/wireguard/wg0.conf # Do not directly modify the main routing table, but manage via PostUp/PostDown
 
   cat >> /etc/wireguard/wg0.conf <<EOF
 
@@ -262,7 +261,7 @@ Endpoint = $ENDPOINT
 AllowedIPs = 0.0.0.0/0
 EOF
 
-  # 只有当 VPS 有原生 IPv6 并且用户输入了 WireGuard IPv6 地址时，才添加 IPv6 的 AllowedIPs
+  # Only add IPv6 AllowedIPs if VPS has native IPv6 AND user entered WireGuard IPv6 address
   if [ -n "$CUSTOM_IPV6_ADDRESS" ] && [ -n "$PUBLIC_V6" ]; then
       echo "AllowedIPs = ::/0" >> /etc/wireguard/wg0.conf
   fi
@@ -272,28 +271,29 @@ EOF
 
   chmod 600 /etc/wireguard/wg0.conf
 
-  info "WireGuard 配置文件已创建: /etc/wireguard/wg0.conf"
+  info "WireGuard configuration file created: /etc/wireguard/wg0.conf"
 
-  # 创建 PostUp 脚本 (wg0_up.sh)
-  # 目标:
-  # 1. 确保来自 VPS 公网 IP 的流量（入站响应）使用主路由表。
-  # 2. 将来自 WireGuard 隧道内部 IP 的流量路由到自定义表。
-  # 3. 将其他（未明确指定）的出站流量通过 WireGuard 隧道。
+  # Create PostUp script (wg0_up.sh)
+  # Goal:
+  # 1. Ensure traffic from VPS public IP (inbound responses) uses the main routing table.
+  # 2. Route traffic from WireGuard tunnel internal IPs to a custom table.
+  # 3. Route other (unspecified) outbound traffic through the WireGuard tunnel.
 
   cat > /etc/wireguard/wg0_up.sh <<EOF
 #!/usr/bin/env bash
-# 此脚本用于 WireGuard 接口启动后配置路由规则
+# This script configures routing rules after the WireGuard interface starts
 
-# 默认启用调试模式 (方便排查问题)
-set -x
+# Removed 'set -x' by default to reduce verbose output during normal operation.
+# To enable debugging, uncomment the line below:
+# set -x
 
-# 获取服务器当前公网 IP 和接口
+# Get server's current public IP and interface
 get_public_ips_in_up_script() {
-    # 通过查询默认路由来获取主要的出站接口
+    # Get the main outbound interface by querying the default route
     PUBLIC_V4_INTERFACE_IN_UP=\$(ip -4 route | grep default | awk '{print \$5; exit}')
     PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route | grep default | awk '{print \$5; exit}')
 
-    # 获取公共 IPv4 和 IPv6 地址
+    # Get public IPv4 and IPv6 addresses
     PUBLIC_V4_IN_UP=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$')
     PUBLIC_V6_IN_UP=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$')
 
@@ -313,36 +313,37 @@ echo "Debug (wg0_up.sh): PUBLIC_V4_INTERFACE_IN_UP = \$PUBLIC_V4_INTERFACE_IN_UP
 echo "Debug (wg0_up.sh): PUBLIC_V6_INTERFACE_IN_UP = \$PUBLIC_V6_INTERFACE_IN_UP"
 
 
-# 循环等待 wg0 接口和其 IPv4/IPv6 地址就绪
+# Loop to wait for wg0 interface and its IPv4/IPv6 addresses to be ready
 ATTEMPTS=0
-MAX_ATTEMPTS=15 # 增加尝试次数，总等待时间为 15 * 2 = 30 秒
+MAX_ATTEMPTS=15 # Increased attempts, total wait time 15 * 2 = 30 seconds
 SLEEP_INTERVAL=2
 
 WG_LOCAL_V4=""
 WG_LOCAL_V6=""
 
-echo "Debug (wg0_up.sh): 等待 wg0 接口获取 IP 地址..."
+echo "Debug (wg0_up.sh): Waiting for wg0 interface to get IP addresses..."
 
 while [ -z "\$WG_LOCAL_V4" ] && [ \$ATTEMPTS -lt \$MAX_ATTEMPTS ]; do
     WG_LOCAL_V4=\$(ip addr show wg0 | grep "inet\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
     if [ -z "\$WG_LOCAL_V4" ]; then
-        echo "Debug (wg0_up.sh): 尝试 \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv4 地址未就绪，等待 \$SLEEP_INTERVAL 秒..."
+        echo "Debug (wg0_up.sh): Attempt \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv4 address not ready, waiting \$SLEEP_INTERVAL seconds..."
         sleep \$SLEEP_INTERVAL
         ATTEMPTS=\$((ATTEMPTS+1))
     fi
 done
 
+# Only attempt to get WG_LOCAL_V6 if a public IPv6 is detected on the VPS
 if [ -n "\$PUBLIC_V6_IN_UP" ]; then
-    ATTEMPTS=0 # 重置尝试次数
+    ATTEMPTS=0 # Reset attempts
     while [ -z "\$WG_LOCAL_V6" ] && [ \$ATTEMPTS -lt \$MAX_ATTEMPTS ]; do
         WG_LOCAL_V6=\$(ip addr show wg0 | grep "inet6\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
-        # 确保获取到的是非 link-local 地址
+        # Ensure a non-link-local address is obtained
         if [[ "\$WG_LOCAL_V6" =~ ^fe80:: ]]; then
-            WG_LOCAL_V6="" # 忽略 link-local 地址
+            WG_LOCAL_V6="" # Ignore link-local address
         fi
 
         if [ -z "\$WG_LOCAL_V6" ]; then
-            echo "Debug (wg0_up.sh): 尝试 \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv6 地址未就绪，等待 \$SLEEP_INTERVAL 秒..."
+            echo "Debug (wg0_up.sh): Attempt \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv6 address not ready, waiting \$SLEEP_INTERVAL seconds..."
             sleep \$SLEEP_INTERVAL
             ATTEMPTS=\$((ATTEMPTS+1))
         fi
@@ -353,16 +354,16 @@ echo "Debug (wg0_up.sh): WG_LOCAL_V4 = \$WG_LOCAL_V4"
 echo "Debug (wg0_up.sh): WG_LOCAL_V6 = \$WG_LOCAL_V6"
 
 if [ -z "\$WG_LOCAL_V4" ]; then
-    echo "错误 (wg0_up.sh): 无法获取 wg0 的 IPv4 地址，WireGuard 可能未正确启动或超时。" >&2
+    echo "Error (wg0_up.sh): Failed to get wg0's IPv4 address, WireGuard might not have started correctly or timed out." >&2
     exit 1
 fi
 
-# 定义自定义路由表 51820
-# (如果不存在则添加，避免重复添加导致错误)
-grep -q '51820\s\+wg_custom' /etc/iproute2/rt_tables || echo '51820   wg_custom' >> /etc/iproute2/rt_tables
+# Define custom routing table 51820
+# (Add if not exists, avoid errors from duplicate additions)
+grep -q '51820\s\+wg_custom' /etc/iproute2/rt_tables || echo '51820       wg_custom' >> /etc/iproute2/rt_tables
 
-# 清理可能存在的旧规则，确保幂等性
-echo "Debug (wg0_up.sh): 清理旧的 IP 规则和路由..."
+# Clean up potentially existing old rules to ensure idempotency
+echo "Debug (wg0_up.sh): Cleaning up old IP rules and routes..."
 ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null
 ip rule del table 51820 suppress_prefixlength 0 2>/dev/null
 [ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null
@@ -371,84 +372,87 @@ ip -4 route del default dev wg0 table 51820 2>/dev/null
 [ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null
 [ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule del from \$PUBLIC_V4_IN_UP lookup main pref 100 2>/dev/null
 [ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule del from \$PUBLIC_V6_IN_UP lookup main pref 100 2>/dev/null
-ip rule del table 51820 pref 300 2>/dev/null # 删除兜底规则，重新添加以确保顺序
+ip rule del table 51820 pref 300 2>/dev/null # Delete fallback rule, re-add to ensure order
 
-# 清理 mangle 表中可能存在的 TCPMSS 规则
+# Clean up potentially existing TCPMSS rules in mangle table
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 
-# 清理旧的 NAT 规则（如果存在）
-# 使用获取到的接口变量进行清理，确保准确性
+# Clean up old NAT rules (if they exist)
+# Use the fetched interface variables for cleanup to ensure accuracy
 [ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
 [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
 
 
-echo "Debug (wg0_up.sh): 添加新的 IP 规则和路由..."
-# 添加新的路由规则
-# 优先级：
-# 1. (最高优先级) 抑制主路由表的默认路由，让自定义规则生效。
-# 这样除了明确指向主表的流量外，其他流量不会默认走主表。
+echo "Debug (wg0_up.sh): Adding new IP rules and routes..."
+# Add new routing rules
+# Priority:
+# 1. (Highest priority) Suppress the main routing table's default route, allowing custom rules to take effect.
+# This ensures that traffic not explicitly directed to the main table does not default to it.
 ip rule add table main suppress_prefixlength 0 pref 50
 
-# 2. 确保来自 VPS 主公网 IP 的流量（入站响应）使用主路由表
+# 2. Ensure traffic from VPS's main public IP (inbound responses) uses the main routing table
 [ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule add from \$PUBLIC_V4_IN_UP lookup main pref 100
 [ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule add from \$PUBLIC_V6_IN_UP lookup main pref 100
 
-# 3. 将来自 WireGuard 接口本地 IP 的流量路由到自定义表
-# 这是为了确保 WireGuard 内部的服务可以正常出站
+# 3. Route traffic from WireGuard interface's local IP to the custom table
+# This ensures that services inside the WireGuard tunnel can egress normally
 [ -n "\$WG_LOCAL_V4" ] && ip -4 rule add from \$WG_LOCAL_V4 lookup 51820 pref 200
 [ -n "\$WG_LOCAL_V6" ] && ip -6 rule add from \$WG_LOCAL_V6 lookup 51820 pref 200
 
-# 4. 定义自定义表 51820 的默认路由，通过 WireGuard 接口
-# 这是 WireGuard 出口
+# 4. Define the default route for custom table 51820, through the WireGuard interface
+# This is the WireGuard egress point
 ip -4 route add default dev wg0 table 51820
 [ -n "\$WG_LOCAL_V6" ] && ip -6 route add default dev wg0 table 51820
 
-# 5. (最低优先级) 兜底规则：所有未被前面规则匹配到的流量都路由到自定义表 51820
-# 这确保了除本地入站响应外的所有其他出站流量都走 WireGuard
+# 5. (Lowest priority) Fallback rule: all traffic not matched by previous rules is routed to custom table 51820
+# This ensures all other outbound traffic, except local inbound responses, goes through WireGuard
 ip rule add table 51820 pref 300
 
-# TCP MSS Clamping，优化性能
+# TCP MSS Clamping, performance optimization
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# --- 配置防火墙 NAT 链规则 (UFW现在处理FORWARD链) ---
-echo "Debug (wg0_up.sh): 配置 iptables/ip6tables NAT 链规则 (FORWARD链由UFW管理)..."
+# --- Configure firewall NAT chain rules (UFW now handles FORWARD chain) ---
+echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules (FORWARD chain managed by UFW)..."
 
-# 为通过 WireGuard 接口出站的流量设置 NAT (Masquerade)
-# 将来自 wg0 的内部 IP 伪装成 VPS 的公共 IP
+# Set up NAT (Masquerade) for outbound traffic through WireGuard interface
+# Masquerade internal IPs from wg0 as the VPS's public IP
 [ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -A POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE
 [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -A POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE
 
-# 额外调试：显示当前路由表和规则
-echo "Debug (wg0_up.sh): 当前 IPv4 路由表 (main 和 51820):"
+# Additional debug: display current routing tables and rules
+echo "Debug (wg0_up.sh): Current IPv4 routing tables (main and 51820):"
 ip -4 route show table main
 ip -4 route show table 51820
-echo "Debug (wg0_up.sh): 当前 IPv6 路由表 (main 和 51820):"
+echo "Debug (wg0_up.sh): Current IPv6 routing tables (main and 51820):"
 ip -6 route show table main
 ip -6 route show table 51820
-echo "Debug (wg0_up.sh): 当前 IP 规则:"
+echo "Debug (wg0_up.sh): Current IP rules:"
 ip rule show
-echo "Debug (wg0_up.sh): 当前 iptables FORWARD 链规则:"
+echo "Debug (wg0_up.sh): Current iptables FORWARD chain rules:"
 iptables -nvL FORWARD
-echo "Debug (wg0_up.sh): 当前 iptables NAT POSTROUTING 链规则:"
+echo "Debug (wg0_up.sh): Current iptables NAT POSTROUTING chain rules:"
 iptables -t nat -nvL POSTROUTING
-echo "Debug (wg0_up.sh): 当前 ip6tables FORWARD 链规则:"
+echo "Debug (wg0_up.sh): Current ip6tables FORWARD chain rules:"
 ip6tables -nvL FORWARD
-echo "Debug (wg0_up.sh): 当前 ip6tables NAT POSTROUTING 链规则:"
+echo "Debug (wg0_up.sh): Current ip6tables NAT POSTROUTING chain rules:"
 ip6tables -t nat -nvL POSTROUTING
 
-echo "Debug (wg0_up.sh): 路由和防火墙规则应用完成。"
+echo "Debug (wg0_up.sh): Routing and firewall rules applied."
 EOF
 
   chmod +x /etc/wireguard/wg0_up.sh
 
-  # 创建 PostDown 脚本 (wg0_down.sh)
+  # Create PostDown script (wg0_down.sh)
   cat > /etc/wireguard/wg0_down.sh <<EOF
 #!/usr/bin/env bash
-# 此脚本用于 WireGuard 接口停止后清理路由规则
+# This script cleans up routing rules after the WireGuard interface stops
 
-# 获取服务器当前公网 IP 和接口
+# Removed 'set -x' by default. Uncomment for debugging:
+# set -x
+
+# Get server's current public IP and interface
 get_public_ips_in_down_script() {
     PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 route | grep default | awk '{print \$5; exit}')
     PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route | grep default | awk '{print \$5; exit}')
@@ -465,17 +469,17 @@ get_public_ips_in_down_script() {
 get_public_ips_in_down_script
 
 
-# 获取 WireGuard 接口的 IP (可能已失效，但尝试获取用于清理旧规则)
+# Get WireGuard interface IPs (might be invalid, but attempt to get for old rule cleanup)
 WG_LOCAL_V4=\$(ip addr show wg0 | grep "inet\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
-# 只有当 VPS 有原生 IPv6 时才尝试获取 wg0 的本地 IPv6 地址
+# Only attempt to get wg0's local IPv6 address if VPS has native IPv6
 [ -n "\$PUBLIC_V6_IN_DOWN" ] && WG_LOCAL_V6=\$(ip addr show wg0 | grep "inet6\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
 
 
-# 删除自定义路由表规则 (确保删除顺序正确，与 PostUp 相反)
+# Delete custom routing table rules (ensure correct deletion order, inverse of PostUp)
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 
-# 清理 NAT 规则
+# Clean up NAT rules
 [ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
 [ -n "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
 
@@ -495,197 +499,197 @@ ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null
 ip rule del table 51820 suppress_prefixlength 0 2>/dev/null
 
 
-# 删除自定义路由表名
+# Delete custom routing table name
 sed -i '/51820\s\+wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null
 EOF
 
   chmod +x /etc/wireguard/wg0_down.sh
 
-  info "WireGuard 启动/停止脚本已创建: /etc/wireguard/wg0_up.sh 和 /etc/wireguard/wg0_down.sh"
+  info "WireGuard startup/shutdown scripts created: /etc/wireguard/wg0_up.sh and /etc/wireguard/wg0_down.sh"
 
-  # 启用并启动 WireGuard 服务
-  ${SYSTEMCTL_ENABLE[int]} >/dev/null 2>&1 || error "启用 WireGuard 服务失败，请检查日志。"
-  ${SYSTEMCTL_START[int]} >/dev/null 2>&1 || error "启动 WireGuard 服务失败，请检查日志。"
+  # Enable and start WireGuard service
+  ${SYSTEMCTL_ENABLE[int]} >/dev/null 2>&1 || error "Failed to enable WireGuard service, please check logs."
+  ${SYSTEMCTL_START[int]} >/dev/null 2>&1 || error "Failed to start WireGuard service, please check logs."
 
-  info "\n--- 自定义 WireGuard VPN 安装成功！ ---"
+  info "\n--- Custom WireGuard VPN installed successfully! ---"
   get_status
 }
 
-# 检查自定义 WireGuard VPN 状态
+# Check custom WireGuard VPN status
 get_status() {
-  info "\n--- 检查自定义 WireGuard VPN 状态 ---"
+  info "\n--- Checking Custom WireGuard VPN Status ---"
   if [ ! -e /etc/wireguard/wg0.conf ]; then
-    warning "未检测到 WireGuard 配置文件 (/etc/wireguard/wg0.conf)。"
+    warning "WireGuard configuration not detected (/etc/wireguard/wg0.conf)."
     return
   fi
 
   local STATUS=$(systemctl is-active wg-quick@wg0 2>/dev/null)
   if [ "$STATUS" = "active" ]; then
-    info "WireGuard 服务状态: 运行中"
+    info "WireGuard service status: Running"
     ip addr show wg0
     echo "-----------------------------------"
     wg show wg0
     echo "-----------------------------------"
-    # 直接使用全局变量 PUBLIC_V4 和 PUBLIC_V6
-    info "您的 VPS 当前公网 IPv4: $PUBLIC_V4"
+    # Use global variables PUBLIC_V4 and PUBLIC_V6 directly
+    info "Your VPS's current public IPv4: $PUBLIC_V4"
     if [ -n "$PUBLIC_V6" ]; then
-        info "您的 VPS 当前公网 IPv6: $PUBLIC_V6"
+        info "Your VPS's current public IPv6: $PUBLIC_V6"
     else
-        warning "您的 VPS 未检测到原生公共 IPv6 地址。"
+        warning "Your VPS did not detect a native public IPv6 address. WireGuard IPv6 functionality may be limited."
     fi
 
-    info "通过 wg0 隧道出站的 IP (如果成功):"
+    info "Outbound IP via wg0 tunnel (if successful):"
     # Ensure curl uses the wg0 interface for these checks
-    curl -s4 --interface wg0 ipinfo.io/ip || echo "  (IPv4 未获取到或未通过 wg0 隧道)"
-    if [ -n "$PUBLIC_V6" ]; then # 只有当 VPS 有原生 IPv6 时才尝试检测 IPv6 隧道
-        # 为 curl -s6 命令添加超时，避免长时间卡住
-        curl -s6 --interface wg0 --max-time 10 ipinfo.io/ip || echo "  (IPv6 未获取到或未通过 wg0 隧道)"
+    curl -s4 --interface wg0 ipinfo.io/ip || echo "  (IPv4 not obtained or not via wg0 tunnel)"
+    if [ -n "$PUBLIC_V6" ]; then # Only attempt to detect IPv6 tunnel if VPS has native IPv6
+        # Add timeout to curl -s6 command to avoid long waits
+        curl -s6 --interface wg0 --max-time 10 ipinfo.io/ip || echo "  (IPv6 not obtained or not via wg0 tunnel)"
     else
-        echo "  (VPS 未检测到原生 IPv6，跳过隧道 IPv6 检测)"
+        echo "  (VPS did not detect native IPv6, skipping tunnel IPv6 detection)"
     fi
-    echo "注意：出站 IP 显示的是通过 wg0 隧道的IP，入站流量仍会走您的原生IP。"
+    echo "Note: Outbound IP shows the IP through the wg0 tunnel, inbound traffic will still use your native IP."
   else
-    warning "WireGuard 服务状态: 未运行或出现错误。"
-    warning "请尝试启动 (选项 3) 或检查日志。"
+    warning "WireGuard service status: Not running or an error occurred."
+    warning "Please try starting (option 3) or check logs."
   fi
 }
 
-# 开启/关闭自定义 WireGuard VPN
+# Turn on/off custom WireGuard VPN
 toggle_wireguard() {
-  info "\n--- 开启/关闭自定义 WireGuard VPN ---"
+  info "\n--- Toggling Custom WireGuard VPN ---"
   if [ ! -e /etc/wireguard/wg0.conf ]; then
-    warning "未检测到 WireGuard 配置。请先安装 (选项 1)。"
+    warning "WireGuard configuration not detected. Please install first (option 1)."
     return
   fi
 
   local STATUS=$(systemctl is-active wg-quick@wg0 2>/dev/null)
   if [ "$STATUS" = "active" ]; then
-    info "正在关闭 WireGuard 服务..."
+    info "Stopping WireGuard service..."
     # For Alpine, wg-quick down wg0 is sufficient as there's no systemd unit for it directly
     [ "$SYSTEM" = Alpine ] && wg-quick down wg0 >/dev/null 2>&1 || systemctl stop wg-quick@wg0 >/dev/null 2>&1
-    info "WireGuard 已关闭。"
+    info "WireGuard stopped."
   else
-    info "正在开启 WireGuard 服务..."
+    info "Starting WireGuard service..."
     ${SYSTEMCTL_START[int]} >/dev/null 2>&1
-    info "WireGuard 已开启。"
+    info "WireGuard started."
   fi
   get_status
 }
 
-# 卸载自定义 WireGuard VPN
+# Uninstall custom WireGuard VPN
 uninstall_wireguard() {
-  info "\n--- 卸载自定义 WireGuard VPN ---"
+  info "\n--- Uninstalling Custom WireGuard VPN ---"
   if [ ! -e /etc/wireguard/wg0.conf ]; then
-    warning "未检测到 WireGuard 配置，无需卸载。"
+    warning "WireGuard configuration not detected, no need to uninstall."
     return
   fi
 
-  # 默认启用调试模式 (方便排查问题)
-  set -x # Enable debugging for uninstall function
+  # Removed 'set -x' by default. Uncomment for debugging:
+  # set -x # Enable debugging for uninstall function
 
-  # 尝试从配置文件中读取ENDPOINT，用于清理UFW规则
+  # Attempt to read ENDPOINT from config file for UFW cleanup
   local UNINSTALL_ENDPOINT=""
   if [ -s /etc/wireguard/wg0.conf ]; then
       UNINSTALL_ENDPOINT=$(grep "Endpoint" /etc/wireguard/wg0.conf | awk -F'= ' '{print $2}' | tr -d '[:space:]')
       echo "Debug (uninstall_wireguard): Detected Endpoint from config: $UNINSTALL_ENDPOINT"
   fi
 
-  info "正在停止并禁用 WireGuard 服务..."
+  info "Stopping and disabling WireGuard service..."
   [ "$SYSTEM" = Alpine ] && wg-quick down wg0 >/dev/null 2>&1 || systemctl stop wg-quick@wg0 >/dev/null 2>&1
   [ "$SYSTEM" = Alpine ] && rc-update del local default 2>/dev/null || systemctl disable wg-quick@wg0 >/dev/null 2>&1
 
-  info "正在删除 WireGuard 配置文件和脚本..."
+  info "Deleting WireGuard configuration files and scripts..."
   rm -f /etc/wireguard/wg0.conf
   rm -f /etc/wireguard/wg0_up.sh
   rm -f /etc/wireguard/wg0_down.sh
 
-  # 删除自定义路由表名
+  # Delete custom routing table name
   sed -i '/51820\s\+wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null
 
-  # 删除 IP 转发的 sysctl 配置
+  # Delete IP forwarding sysctl configuration
   rm -f /etc/sysctl.d/99-wireguard-forwarding.conf
-  sysctl --system >/dev/null 2>&1 # 重新加载所有 sysctl 配置，移除此脚本添加的转发规则
+  sysctl --system >/dev/null 2>&1 # Reload all sysctl configurations, removing forwarding rules added by this script
 
-  # 清理 UFW 规则
+  # Clean up UFW rules
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-      info "正在清理 UFW 规则..."
-      # 移除 WireGuard 接口的流量转发规则
+      info "Cleaning up UFW rules..."
+      # Remove WireGuard interface forwarding rules
       ufw delete allow in on wg0 comment 'Allow WireGuard inbound traffic' 2>/dev/null
       ufw delete allow out on wg0 comment 'Allow WireGuard outbound traffic' 2>/dev/null
-      # 移除 WireGuard UDP 端口规则
+      # Remove WireGuard UDP port rule
       local UNINSTALL_ENDPOINT_PORT=""
       if [ -n "$UNINSTALL_ENDPOINT" ]; then
           UNINSTALL_ENDPOINT_PORT=$(echo "$UNINSTALL_ENDPOINT" | awk -F':' '{print $NF}')
           echo "Debug (uninstall_wireguard): Endpoint Port for cleanup: $UNINSTALL_ENDPOINT_PORT"
-          ufw delete allow $UNINSTALL_ENDPOINT_PORT/udp comment "Allow WireGuard UDP traffic" 2>/dev/null
+          ufw delete allow "$UNINSTALL_ENDPOINT_PORT"/udp comment "Allow WireGuard UDP traffic" 2>/dev/null
       else
-          warning "无法从配置文件获取WireGuard端口，请手动检查UFW规则以确保端口清理。"
+          warning "Could not get WireGuard port from config file, please manually check UFW rules to ensure port cleanup."
       fi
       
-      # 恢复 UFW 的转发策略 (如果之前是 ACCEPT)
-      # 仅在检测到当前为 ACCEPT 时才改回 DROP，避免影响用户其他配置
+      # Restore UFW forwarding policy (if it was ACCEPT before)
+      # Only change back to DROP if currently detected as ACCEPT, to avoid affecting other user configurations
       if grep -q 'DEFAULT_FORWARD_POLICY="ACCEPT"' /etc/default/ufw; then
           sed -i 's/DEFAULT_FORWARD_POLICY="ACCEPT"/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw
-          info "UFW DEFAULT_FORWARD_POLICY 已尝试恢复为 DROP。"
+          info "UFW DEFAULT_FORWARD_POLICY attempted to be restored to DROP."
       fi
-      ufw reload >/dev/null 2>&1 || warning "UFW 重载失败，请手动检查。"
-      info "UFW 规则已清理。请手动检查 /etc/default/ufw 中的 DEFAULT_FORWARD_POLICY。"
+      ufw reload >/dev/null 2>&1 || warning "UFW reload failed, please check manually."
+      info "UFW rules cleaned up. Please manually check DEFAULT_FORWARD_POLICY in /etc/default/ufw."
   fi
 
-  # 尝试卸载 wireguard-tools 依赖 (可选，但为了清理)
-  reading "是否卸载 wireguard-tools 软件包？ (y/N): " UNINSTALL_DEPS_CONFIRM
+  # Attempt to uninstall wireguard-tools dependency (optional, but for cleanup)
+  reading "Do you want to uninstall wireguard-tools package? (y/N): " UNINSTALL_DEPS_CONFIRM
   if [[ "${UNINSTALL_DEPS_CONFIRM,,}" = "y" ]]; then
-    info "正在卸载 wireguard-tools..."
-    ${PACKAGE_UNINSTALL[int]} wireguard-tools >/dev/null 2>&1 || warning "卸载 wireguard-tools 失败，请手动检查。"
-    # 同时卸载 openresolv，如果它是作为依赖安装的
+    info "Uninstalling wireguard-tools..."
+    ${PACKAGE_UNINSTALL[int]} wireguard-tools >/dev/null 2>&1 || warning "Failed to uninstall wireguard-tools, please check manually."
+    # Also uninstall openresolv if it was installed as a dependency
     if command -v apt >/dev/null; then
-        sudo apt autoremove --purge openresolv -y >/dev/null 2>&1 || warning "卸载 openresolv 失败，请手动检查。"
+        sudo apt autoremove --purge openresolv -y >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v yum >/dev/null || command -v dnf >/dev/null; then
-        sudo yum autoremove openresolv -y >/dev/null 2>&1 || sudo dnf autoremove openresolv -y >/dev/null 2>&1 || warning "卸载 openresolv 失败，请手动检查。"
+        sudo yum autoremove openresolv -y >/dev/null 2>&1 || sudo dnf autoremove openresolv -y >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v apk >/dev/null; then
-        sudo apk del openresolv >/dev/null 2>&1 || warning "卸载 openresolv 失败，请手动检查。"
+        sudo apk del openresolv >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v pacman >/dev/null; then
-        sudo pacman -Rcnsu openresolv --noconfirm >/dev/null 2>&1 || warning "卸载 openresolv 失败，请手动检查。"
+        sudo pacman -Rcnsu openresolv --noconfirm >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     fi
   fi
 
-  info "WireGuard 已彻底卸载。"
-  # 直接使用全局变量 PUBLIC_V4 和 PUBLIC_V6
-  info "您的 VPS 当前公网 IPv4: $PUBLIC_V4"
+  info "WireGuard completely uninstalled."
+  # Use global variables PUBLIC_V4 and PUBLIC_V6 directly
+  info "Your VPS's current public IPv4: $PUBLIC_V4"
   if [ -n "$PUBLIC_V6" ]; then
-      info "您的 VPS 当前公网 IPv6: $PUBLIC_V6"
+      info "Your VPS's current public IPv6: $PUBLIC_V6"
   else
-      warning "您的 VPS 未检测到原生公共 IPv6 地址。"
+      warning "Your VPS did not detect a native public IPv6 address."
   fi
 }
 
-# 主菜单
+# Main menu
 menu() {
   clear
-  info "--- 自定义 WireGuard VPN 管理脚本 v$VERSION ---"
+  info "--- Custom WireGuard VPN Management Script v$VERSION ---"
   echo ""
-  info "当前操作系统: $SYS"
-  info "内核版本: $(uname -r)"
+  info "Current operating system: $SYS"
+  info "Kernel version: $(uname -r)"
   echo ""
-  # 确保 PUBLIC_V4 和 PUBLIC_V6 在此之前被 get_public_ips 填充
-  # 这里不调用 get_status，直接显示公共 IP，因为 get_status 内部会再次检查 WireGuard 状态
-  # 并在 menu() 顶部已调用 get_public_ips
-  info "您的 VPS 当前公网 IPv4: ${PUBLIC_V4:-'未检测到'}"
+  # Ensure PUBLIC_V4 and PUBLIC_V6 are populated by get_public_ips before this
+  # Not calling get_status here, directly show public IP, as get_status will check WireGuard status again
+  # get_public_ips is already called at the top of menu()
+  info "Your VPS's current public IPv4: ${PUBLIC_V4:-'Not detected'}"
   if [ -n "$PUBLIC_V6" ]; then
-      info "您的 VPS 当前公网 IPv6: $PUBLIC_V6"
+      info "Your VPS's current public IPv6: $PUBLIC_V6"
   else
-      warning "您的 VPS 未检测到原生公共 IPv6 地址。"
+      warning "Your VPS did not detect a native public IPv6 address. WireGuard IPv6 functionality may be limited."
   fi
   echo ""
-  get_status # 显示 WireGuard 状态摘要
+  get_status # Show WireGuard status summary
   echo ""
-  info "请选择一个操作:"
-  info "1. 安装自定义 WireGuard VPN"
-  info "2. 获取 WireGuard VPN 状态"
-  info "3. 开启/关闭 WireGuard VPN"
-  info "4. 卸载 WireGuard VPN"
-  info "0. 退出脚本"
-  reading "\n请输入您的选择: " CHOICE
+  info "Please select an operation:"
+  info "1. Install Custom WireGuard VPN"
+  info "2. Get WireGuard VPN Status"
+  info "3. Turn On/Off WireGuard VPN"
+  info "4. Uninstall WireGuard VPN"
+  info "0. Exit Script"
+  reading "\nPlease enter your choice: " CHOICE
 
   case "$CHOICE" in
     1)
@@ -697,26 +701,26 @@ menu() {
     3)
       toggle_wireguard
       ;;
-    4) # <-- 新增：处理选项 4
+    4)
       uninstall_wireguard
       ;;
     0)
-      info "退出脚本。再见！"
+      info "Exiting script. Goodbye!"
       exit 0
       ;;
     *)
-      warning "无效的选择，请重新输入。"
+      warning "Invalid choice, please re-enter."
       ;;
   esac
-  info "\n按任意键返回主菜单..."
+  info "\nPress any key to return to main menu..."
   read -n 1 -s
   menu
 }
 
-# --- 脚本入口点 ---
+# --- Script Entry Point ---
 
 check_root
 check_operating_system
 check_dependencies
-get_public_ips # 确保在脚本开始时就获取 VPS 的公网 IP
+get_public_ips # Ensure VPS public IP is obtained at script start
 menu
