@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Current script version number
-VERSION='1.0.12' # Version updated for typo fix and continued IPv6 debugging
+VERSION='1.0.13' # Version updated for critical IP rule fix and robust interface detection
 
 # Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
@@ -172,7 +172,10 @@ install_custom_wireguard() {
 
   # Collect user input
   reading "Please enter your WireGuard Private Key (PrivateKey): " PRIVATE_KEY
-  [ -z "$PRIVATE_KEY" ] && error "Private key cannot be empty!"
+  # Validate key format/length
+  if [[ ! "$PRIVATE_KEY" =~ ^[A-Za-z0-9+/]{43}=?$ ]]; then
+    error "Invalid Private Key format. It should be a 44-character Base64 string."
+  fi
 
   reading "Please enter your WireGuard IPv4 address (e.g.: 10.0.0.2/24): " CUSTOM_IPV4_ADDRESS
   [ -z "$CUSTOM_IPV4_ADDRESS" ] && error "IPv4 address cannot be empty!"
@@ -181,11 +184,18 @@ install_custom_wireguard() {
 
   reading "Please enter Peer Public Key (Peer PublicKey): " PEER_PUBLIC_KEY
   [ -z "$PEER_PUBLIC_KEY" ] && error "Peer public key cannot be empty!"
+  # Validate key format/length
+  if [[ ! "$PEER_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=?$ ]]; then
+    error "Invalid Peer Public Key format. It should be a 44-character Base64 string."
+  fi
 
   reading "Please enter Peer Endpoint (e.g.: vpn.example.com:51820): " ENDPOINT
   [ -z "$ENDPOINT" ] && error "Endpoint cannot be empty!"
 
   reading "Please enter PresharedKey (Optional, leave blank to not use): " PRESHARED_KEY
+  if [ -n "$PRESHARED_KEY" ] && [[ ! "$PRESHARED_KEY" =~ ^[A-Za-z0-9+/]{43}=?$ ]]; then
+    error "Invalid PresharedKey format. It should be a 44-character Base64 string."
+  fi
 
   reading "Please enter PersistentKeepalive (Optional, seconds, leave blank to not use): " PERSISTENT_KEEPALIVE
 
@@ -292,21 +302,38 @@ echo "--- Debugging wg0_up.sh ---"
 # Get server's current public IP and interface
 get_public_ips_in_up_script() {
     echo "Debug: Getting public IPs and interfaces..."
-    # Get the main outbound interface by querying the default route
-    PUBLIC_V4_INTERFACE_IN_UP=\$(ip -4 route | grep default | awk '{print \$5; exit}')
-    PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route | grep default | awk '{print \$5; exit}')
-
-    # Get public IPv4 and IPv6 addresses
+    # Attempt to get public IPs using ip route get, which is usually accurate for active routes
     PUBLIC_V4_IN_UP=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$')
     PUBLIC_V6_IN_UP=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$')
 
-    # Fallback for IP addresses if ip route get doesn't work
+    # Fallback for public IPs if ip route get doesn't work (e.g., no default route, or specific network configs)
     [ -z "\$PUBLIC_V4_IN_UP" ] && PUBLIC_V4_IN_UP=\$(ip -4 addr show | grep 'global' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
     [ -z "\$PUBLIC_V6_IN_UP" ] && PUBLIC_V6_IN_UP=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
 
-    # Fallback for interfaces if default route is not found or has no interface
-    [ -z "\$PUBLIC_V4_INTERFACE_IN_UP" ] && PUBLIC_V4_INTERFACE_IN_UP=\$(ip -4 addr show | grep 'global' | awk '{print \$NF}' | head -n 1)
-    [ -z "\$PUBLIC_V6_INTERFACE_IN_UP" ] && PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$NF}' | head -n 1)
+    # If public IPs still not found, exit with an error. NAT won't work otherwise.
+    if [ -z "\$PUBLIC_V4_IN_UP" ] && [ -z "\$PUBLIC_V6_IN_UP" ]; then
+        echo "Error (wg0_up.sh): Failed to determine either public IPv4 or IPv6 address of the VPS after multiple attempts. Aborting." >&2
+        exit 1
+    fi
+
+    # Now, try to get the interfaces using the identified public IPs (more robust)
+    PUBLIC_V4_INTERFACE_IN_UP=""
+    if [ -n "\$PUBLIC_V4_IN_UP" ]; then
+        PUBLIC_V4_INTERFACE_IN_UP=\$(ip route get "\$PUBLIC_V4_IN_UP" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        [ -z "\$PUBLIC_V4_INTERFACE_IN_UP" ] && PUBLIC_V4_INTERFACE_IN_UP=\$(ip -4 addr show | grep "\$PUBLIC_V4_IN_UP" | awk '{print \$NF}' | head -n 1)
+        if [ -z "\$PUBLIC_V4_INTERFACE_IN_UP" ]; then
+            echo "Warning (wg0_up.sh): Could not determine the public IPv4 interface for NAT. IPv4 masquerading may not work correctly." >&2
+        fi
+    fi
+
+    PUBLIC_V6_INTERFACE_IN_UP=""
+    if [ -n "\$PUBLIC_V6_IN_UP" ]; then
+        PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route get "\$PUBLIC_V6_IN_UP" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        [ -z "\$PUBLIC_V6_INTERFACE_IN_UP" ] && PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 addr show | grep "\$PUBLIC_V6_IN_UP" | awk '{print \$NF}' | head -n 1)
+        if [ -z "\$PUBLIC_V6_INTERFACE_IN_UP" ]; then
+            echo "Warning (wg0_up.sh): Could not determine the public IPv6 interface for NAT. IPv6 masquerading may not work correctly." >&2
+        fi
+    fi
 }
 get_public_ips_in_up_script
 
@@ -370,25 +397,39 @@ echo "Debug (wg0_up.sh): Final WG_LOCAL_V6 = \$WG_LOCAL_V6"
 
 
 # Define custom routing table 51820
-# (Add if not exists, avoid errors from duplicate additions)
+# Ensure only one entry for 51820 wg_custom exists and it's correctly formatted
 echo "Debug (wg0_up.sh): Adding/verifying custom routing table 'wg_custom' (51820)..."
-grep -q '51820\s\+wg_custom' /etc/iproute2/rt_tables || echo '51820       wg_custom' >> /etc/iproute2/rt_tables
+if ! grep -qE '^51820\s+wg_custom$' /etc/iproute2/rt_tables; then
+    # Remove any existing lines containing '51820' or 'wg_custom' to prevent duplicates/malformed entries
+    sed -i '/51820/d; /wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null || true
+    echo -e "51820\twg_custom" >> /etc/iproute2/rt_tables # Use tab for consistency
+fi
+
 
 # Clean up potentially existing old rules to ensure idempotency
 echo "Debug (wg0_up.sh): Cleaning up old IP rules and routes..."
+# Use 'table' directly and suppress errors
 ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null || true
 ip rule del table 51820 suppress_prefixlength 0 2>/dev/null || true
-[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null || true
-[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 lookup 51820 pref 200 2>/dev/null || true
+[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 table 51820 pref 200 2>/dev/null || true
+[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 table 51820 pref 200 2>/dev/null || true
 ip -4 route del default dev wg0 table 51820 2>/dev/null || true
 [ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null || true
-[ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule del from \$PUBLIC_V4_IN_UP lookup main pref 100 2>/dev/null || true
-[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule del from \$PUBLIC_V6_IN_UP lookup main pref 100 2>/dev/null || true
+[ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule del from \$PUBLIC_V4_IN_UP table main pref 100 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule del from \$PUBLIC_V6_IN_UP table main pref 100 2>/dev/null || true
 ip rule del table 51820 pref 300 2>/dev/null || true # Delete fallback rule, re-add to ensure order
 
 # Clean up potentially existing TCPMSS rules in mangle table
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+# Clean up old FORWARD chain rules (explicitly added by script)
+iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
+ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
 
 # Clean up old NAT rules (if they exist)
 echo "Debug (wg0_up.sh): Cleaning up old NAT rules..."
@@ -404,14 +445,14 @@ echo "Debug (wg0_up.sh): Adding new IP rules and routes..."
 ip rule add table main suppress_prefixlength 0 pref 50
 
 # 2. Ensure traffic from VPS's main public IP (inbound responses) uses the main routing table
-[ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule add from \$PUBLIC_V4_IN_UP lookup main pref 100
-[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule add from \$PUBLIC_V6_IN_UP lookup main pref 100
+[ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule add from \$PUBLIC_V4_IN_UP table main pref 100
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule add from \$PUBLIC_V6_IN_UP table main pref 100
 
-# 3. Route traffic from WireGuard interface's local IP to the custom table
+# 3. 将来自 WireGuard 接口本地 IP 的流量路由到自定义表
 # This ensures that services inside the WireGuard tunnel can egress normally
-[ -n "\$WG_LOCAL_V4" ] && ip -4 rule add from \$WG_LOCAL_V4 lookup 51820 pref 200
+[ -n "\$WG_LOCAL_V4" ] && ip -4 rule add from \$WG_LOCAL_V4 table 51820 pref 200
 # Only add IPv6 rule if WG_LOCAL_V6 was successfully obtained
-[ -n "\$WG_LOCAL_V6" ] && ip -6 rule add from \$WG_LOCAL_V6 lookup 51820 pref 200
+[ -n "\$WG_LOCAL_V6" ] && ip -6 rule add from \$WG_LOCAL_V6 table 51820 pref 200
 
 # 4. Define the default route for custom table 51820, through the WireGuard interface
 # This is the WireGuard egress point
@@ -438,6 +479,10 @@ ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 # Allow traffic from wg0 interface to anywhere
 iptables -A FORWARD -i wg0 -j ACCEPT
 ip6tables -A FORWARD -i wg0 -j ACCEPT
+
+# Allow traffic from other interfaces to wg0 (e.g., if you have other internal networks that need to use WG)
+iptables -A FORWARD -o wg0 -j ACCEPT
+ip6tables -A FORWARD -o wg0 -j ACCEPT
 
 # --- Configure firewall NAT chain rules ---
 echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules..."
@@ -478,7 +523,7 @@ EOF
 # This script cleans up routing rules after the WireGuard interface stops
 
 # Enable debugging. Uncomment the line below for verbose output:
-# set -x
+set -x
 set -e # Exit immediately if a command exits with a non-zero status.
 
 echo "--- Debugging wg0_down.sh ---"
@@ -495,8 +540,16 @@ get_public_ips_in_down_script() {
     [ -z "\$PUBLIC_V4_IN_DOWN" ] && PUBLIC_V4_IN_DOWN=\$(ip -4 addr show | grep 'global' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
     [ -z "\$PUBLIC_V6_IN_DOWN" ] && PUBLIC_V6_IN_DOWN=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
 
-    [ -z "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 addr show | grep 'global' | awk '{print \$NF}' | head -n 1)
-    [ -z "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$NF}' | head -n 1)
+    # Now, try to get the interfaces using the identified public IPs (more robust)
+    if [ -n "\$PUBLIC_V4_IN_DOWN" ]; then
+        PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip route get "\$PUBLIC_V4_IN_DOWN" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        [ -z "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 addr show | grep "\$PUBLIC_V4_IN_DOWN" | awk '{print \$NF}' | head -n 1)
+    fi
+
+    if [ -n "\$PUBLIC_V6_IN_DOWN" ]; then
+        PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route get "\$PUBLIC_V6_IN_DOWN" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        [ -z "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 addr show | grep "\$PUBLIC_V6_IN_DOWN" | awk '{print \$NF}' | head -n 1)
+    fi
 }
 get_public_ips_in_down_script
 
@@ -530,6 +583,8 @@ iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/
 ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
 ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
+ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
 
 
 echo "Debug (wg0_down.sh): Deleting custom IP rules and routes..."
@@ -538,11 +593,11 @@ ip rule del table 51820 pref 300 2>/dev/null || true
 ip -4 route del default dev wg0 table 51820 2>/dev/null || true
 [ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null || true
 
-[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null || true
-[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 lookup 51820 pref 200 2>/dev/null || true
+[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 table 51820 pref 200 2>/dev/null || true
+[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 table 51820 pref 200 2>/dev/null || true
 
-[ -n "\$PUBLIC_V4_IN_DOWN" ] && ip -4 rule del from \$PUBLIC_V4_IN_DOWN lookup main pref 100 2>/dev/null || true
-[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip -6 rule del from \$PUBLIC_V6_IN_DOWN lookup main pref 100 2>/dev/null || true
+[ -n "\$PUBLIC_V4_IN_DOWN" ] && ip -4 rule del from \$PUBLIC_V4_IN_DOWN table main pref 100 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip -6 rule del from \$PUBLIC_V6_IN_DOWN table main pref 100 2>/dev/null || true
 
 ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null || true
 ip rule del table 51820 suppress_prefixlength 0 2>/dev/null || true
@@ -550,7 +605,8 @@ ip rule del table 51820 suppress_prefixlength 0 2>/dev/null || true
 
 # Delete custom routing table name
 echo "Debug (wg0_down.sh): Deleting 'wg_custom' (51820) from rt_tables..."
-sed -i '/51820\s\+wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null || true
+# Remove any existing lines containing '51820' or 'wg_custom' to ensure clean removal
+sed -i '/51820/d; /wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null || true
 
 echo "--- wg0_down.sh Debugging Complete ---"
 EOF
@@ -664,7 +720,8 @@ uninstall_wireguard() {
   rm -f /etc/wireguard/wg0_down.sh
 
   # Delete custom routing table name
-  sed -i '/51820\s\+wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null
+  # Remove any existing lines containing '51820' or 'wg_custom' to ensure clean removal
+  sed -i '/51820/d; /wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null || true
 
   # Delete IP forwarding sysctl configuration
   rm -f /etc/sysctl.d/99-wireguard-forwarding.conf
@@ -706,7 +763,6 @@ uninstall_wireguard() {
         sudo apt autoremove --purge openresolv -y >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v yum >/dev/null || command -v dnf >/dev/null; then
         sudo yum autoremove openresolv -y >/dev/null 2>&1 || sudo dnf autoremove openresolv -y >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
-    对了，我在 `wg0_up.sh` 和 `wg0_down.sh` 脚本中默认启用了 `set -x`。这将提供非常详细的执行日志，帮助我们追踪每一步命令的执行情况。请运行更新后的脚本，并在出现问题时提供这些日志的完整输出，这将是解决 IPv6 问题的关键。
     elif command -v apk >/dev/null; then
         sudo apk del openresolv >/dev/null 2>&1 || warning "Failed to uninstall openresolv, please check manually."
     elif command -v pacman >/dev/null; then
