@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='1.0.9' # 版本号更新，增加对UFW防火墙的兼容性处理
+VERSION='1.0.10' # 版本号更新，修复卸载时UFW端口清理问题
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -580,6 +580,16 @@ uninstall_wireguard() {
     return
   fi
 
+  # 默认启用调试模式 (方便排查问题)
+  set -x # Enable debugging for uninstall function
+
+  # 尝试从配置文件中读取ENDPOINT，用于清理UFW规则
+  local UNINSTALL_ENDPOINT=""
+  if [ -s /etc/wireguard/wg0.conf ]; then
+      UNINSTALL_ENDPOINT=$(grep "Endpoint" /etc/wireguard/wg0.conf | awk -F'= ' '{print $2}' | tr -d '[:space:]')
+      echo "Debug (uninstall_wireguard): Detected Endpoint from config: $UNINSTALL_ENDPOINT"
+  fi
+
   info "正在停止并禁用 WireGuard 服务..."
   [ "$SYSTEM" = Alpine ] && wg-quick down wg0 >/dev/null 2>&1 || systemctl stop wg-quick@wg0 >/dev/null 2>&1
   [ "$SYSTEM" = Alpine ] && rc-update del local default 2>/dev/null || systemctl disable wg-quick@wg0 >/dev/null 2>&1
@@ -603,12 +613,21 @@ uninstall_wireguard() {
       ufw delete allow in on wg0 comment 'Allow WireGuard inbound traffic' 2>/dev/null
       ufw delete allow out on wg0 comment 'Allow WireGuard outbound traffic' 2>/dev/null
       # 移除 WireGuard UDP 端口规则
-      local ENDPOINT_PORT=$(echo "$ENDPOINT" | awk -F':' '{print $NF}')
-      ufw delete allow $ENDPOINT_PORT/udp comment "Allow WireGuard UDP traffic" 2>/dev/null
-      # 恢复 UFW 的转发策略 (如果之前是 DROP)
-      # 注意：这里不能简单地设回DROP，因为用户可能还有其他需要转发的流量
-      # 最安全的做法是提示用户手动检查或不修改
-      # sed -i 's/DEFAULT_FORWARD_POLICY="ACCEPT"/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw # 不建议自动改回
+      local UNINSTALL_ENDPOINT_PORT=""
+      if [ -n "$UNINSTALL_ENDPOINT" ]; then
+          UNINSTALL_ENDPOINT_PORT=$(echo "$UNINSTALL_ENDPOINT" | awk -F':' '{print $NF}')
+          echo "Debug (uninstall_wireguard): Endpoint Port for cleanup: $UNINSTALL_ENDPOINT_PORT"
+          ufw delete allow $UNINSTALL_ENDPOINT_PORT/udp comment "Allow WireGuard UDP traffic" 2>/dev/null
+      else
+          warning "无法从配置文件获取WireGuard端口，请手动检查UFW规则以确保端口清理。"
+      fi
+      
+      # 恢复 UFW 的转发策略 (如果之前是 ACCEPT)
+      # 仅在检测到当前为 ACCEPT 时才改回 DROP，避免影响用户其他配置
+      if grep -q 'DEFAULT_FORWARD_POLICY="ACCEPT"' /etc/default/ufw; then
+          sed -i 's/DEFAULT_FORWARD_POLICY="ACCEPT"/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw
+          info "UFW DEFAULT_FORWARD_POLICY 已尝试恢复为 DROP。"
+      fi
       ufw reload >/dev/null 2>&1 || warning "UFW 重载失败，请手动检查。"
       info "UFW 规则已清理。请手动检查 /etc/default/ufw 中的 DEFAULT_FORWARD_POLICY。"
   fi
