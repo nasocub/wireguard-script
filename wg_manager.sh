@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Current script version number
-VERSION='1.0.17' # Version updated to handle IP detection failure during startup
+VERSION='1.0.18' # Version updated to handle systems without a configured public IPv6 interface
 
 # Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
@@ -418,19 +418,19 @@ ip rule del pref 300 2>/dev/null || true
 ip rule del pref 50 2>/dev/null || true # Cleanup for old script versions that used suppress_prefixlength
 
 ip -4 route flush table 51820 2>/dev/null || true
-ip -6 route flush table 51820 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 route flush table 51820 2>/dev/null || true
 
 # Clean up potentially existing TCPMSS rules in mangle table
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 # Clean up old FORWARD chain rules (explicitly added by script)
 iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
 
 # Clean up old NAT rules (if they exist)
 echo "Debug (wg0_up.sh): Cleaning up old NAT rules..."
@@ -464,22 +464,22 @@ ip rule add table 51820 pref 300
 # TCP MSS Clamping, performance optimization
 echo "Debug (wg0_up.sh): Adding TCP MSS clamping rules..."
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 # --- Configure firewall FORWARD chain rules explicitly (complementing UFW) ---
 echo "Debug (wg0_up.sh): Configuring iptables/ip6tables FORWARD chain rules explicitly..."
 
 # Allow established and related connections for both IPv4 and IPv6
 iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 # Allow traffic from wg0 interface to anywhere
 iptables -A FORWARD -i wg0 -j ACCEPT
-ip6tables -A FORWARD -i wg0 -j ACCEPT
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -A FORWARD -i wg0 -j ACCEPT
 
 # Allow traffic from other interfaces to wg0 (e.g., if you have other internal networks that need to use WG)
 iptables -A FORWARD -o wg0 -j ACCEPT
-ip6tables -A FORWARD -o wg0 -j ACCEPT
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip6tables -A FORWARD -o wg0 -j ACCEPT
 
 # --- Configure firewall NAT chain rules ---
 echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules..."
@@ -495,19 +495,23 @@ echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules..."
 echo "Debug (wg0_up.sh): Current IPv4 routing table (main and 51820):"
 ip -4 route show table main
 ip -4 route show table 51820
-echo "Debug (wg0_up.sh): Current IPv6 routing table (main and 51820):"
-ip -6 route show table main
-ip -6 route show table 51820
+if [ -n "\$PUBLIC_V6_IN_UP" ]; then
+  echo "Debug (wg0_up.sh): Current IPv6 routing table (main and 51820):"
+  ip -6 route show table main
+  ip -6 route show table 51820
+fi
 echo "Debug (wg0_up.sh): Current IP rules:"
 ip rule show
 echo "Debug (wg0_up.sh): Current iptables FORWARD chain rules:"
 iptables -nvL FORWARD
 echo "Debug (wg0_up.sh): Current iptables NAT POSTROUTING chain rules:"
 iptables -t nat -nvL POSTROUTING
-echo "Debug (wg0_up.sh): Current ip6tables FORWARD chain rules:"
-ip6tables -nvL FORWARD
-echo "Debug (wg0_up.sh): Current ip6tables NAT POSTROUTING chain rules:"
-ip6tables -t nat -nvL POSTROUTING
+if [ -n "\$PUBLIC_V6_IN_UP" ]; then
+  echo "Debug (wg0_up.sh): Current ip6tables FORWARD chain rules:"
+  ip6tables -nvL FORWARD
+  echo "Debug (wg0_up.sh): Current ip6tables NAT POSTROUTING chain rules:"
+  ip6tables -t nat -nvL POSTROUTING
+fi
 
 echo "--- wg0_up.sh Debugging Complete ---"
 EOF
@@ -567,7 +571,7 @@ echo "Debug (wg0_down.sh): WG_LOCAL_V6 (for cleanup) = \$WG_LOCAL_V6"
 # Delete custom routing table rules (ensure correct deletion order, inverse of PostUp)
 echo "Debug (wg0_down.sh): Deleting TCP MSS clamping rules..."
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 # Clean up NAT rules
 echo "Debug (wg0_down.sh): Cleaning up NAT rules..."
@@ -577,18 +581,18 @@ echo "Debug (wg0_down.sh): Cleaning up NAT rules..."
 # Clean up explicit FORWARD chain rules
 echo "Debug (wg0_down.sh): Cleaning up explicit FORWARD rules..."
 iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
 
 
 echo "Debug (wg0_down.sh): Deleting custom IP rules and routes..."
 ip rule del pref 300 2>/dev/null || true
 
 ip -4 route flush table 51820 2>/dev/null || true
-ip -6 route flush table 51820 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip -6 route flush table 51820 2>/dev/null || true
 
 [ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 table 51820 pref 200 2>/dev/null || true
 [ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 table 51820 pref 200 2>/dev/null || true
