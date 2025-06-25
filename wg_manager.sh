@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='1.0.5' # 版本号更新，表示有修改，主要修复IPv6转发问题
+VERSION='1.0.6' # 版本号更新，主要修复IPv6转发中的NAT问题
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -68,8 +68,8 @@ check_dependencies() {
     DEPS_CHECK=("ping" "curl" "grep" "bash" "ip" "wget" "resolvconf")
     DEPS_INSTALL=("iputils-ping" "curl" "grep" "bash" "iproute2" "wget" "openresolv") # Alpine uses openresolv
   else
-    DEPS_CHECK=("ping" "wget" "curl" "systemctl" "ip" "resolvconf")
-    DEPS_INSTALL=("iputils-ping" "wget" "curl" "systemctl" "iproute2" "openresolv") # Ubuntu/Debian uses openresolv
+    DEPS_CHECK=("ping" "wget" "curl" "systemctl" "ip" "resolvconf" "iptables" "ip6tables") # Add iptables/ip6tables check
+    DEPS_INSTALL=("iputils-ping" "wget" "curl" "systemctl" "iproute2" "openresolv" "iptables" "iptables") # Add iptables/ip6tables to install list
   fi
 
   local DEPS_TO_INSTALL=()
@@ -132,11 +132,13 @@ get_public_ips() {
     # Get the source IP that would be used for reaching a well-known public IPv6 address
     # Use a common IPv6 DNS server like Cloudflare or Google
     PUBLIC_V6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print $NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}$')
+    PUBLIC_V6_INTERFACE=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;++i) if ($i=="dev") { print $(i+1); exit; }}')
 
     # Fallback to ip addr show if ip route get doesn't work (e.g., no default route, or for link-local addresses)
     [ -z "$PUBLIC_V4" ] && PUBLIC_V4=$(ip -4 addr show | grep 'global' | awk '{print $2}' | cut -d/ -f1 | head -n 1)
     # For IPv6, ensure we get a global scope address and not link-local
     [ -z "$PUBLIC_V6" ] && PUBLIC_V6=$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+    [ -z "$PUBLIC_V6_INTERFACE" ] && PUBLIC_V6_INTERFACE=$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print $NF}' | head -n 1)
 }
 
 
@@ -250,17 +252,21 @@ EOF
 # 启用调试模式 (取消注释 'set -x' 以查看详细执行过程)
 # set -x
 
-# 获取服务器当前公网 IP，优先通过路由表获取 (重新检测以避免环境依赖)
+# 获取服务器当前公网 IP 和接口，优先通过路由表获取 (重新检测以避免环境依赖)
 get_public_ips_in_up_script() {
     PUBLIC_V4_IN_UP=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$')
     PUBLIC_V6_IN_UP=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$')
+    PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+
     [ -z "\$PUBLIC_V4_IN_UP" ] && PUBLIC_V4_IN_UP=\$(ip -4 addr show | grep 'global' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
     [ -z "\$PUBLIC_V6_IN_UP" ] && PUBLIC_V6_IN_UP=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
+    [ -z "\$PUBLIC_V6_INTERFACE_IN_UP" ] && PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$NF}' | head -n 1)
 }
 get_public_ips_in_up_script
 
 echo "Debug (wg0_up.sh): PUBLIC_V4_IN_UP = \$PUBLIC_V4_IN_UP"
 echo "Debug (wg0_up.sh): PUBLIC_V6_IN_UP = \$PUBLIC_V6_IN_UP"
+echo "Debug (wg0_up.sh): PUBLIC_V6_INTERFACE_IN_UP = \$PUBLIC_V6_INTERFACE_IN_UP"
 
 
 # 循环等待 wg0 接口和其 IPv4/IPv6 地址就绪
@@ -327,6 +333,10 @@ ip rule del table 51820 pref 300 2>/dev/null # 删除兜底规则，重新添加
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 
+# 清理旧的 NAT 规则（如果存在）
+[ -n "\$PUBLIC_V4_IN_UP" ] && iptables -t nat -D POSTROUTING -o \$(ip route get \$PUBLIC_V4_IN_UP | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}') -j MASQUERADE 2>/dev/null
+[ -n "\$PUBLIC_V6_IN_UP" ] && [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
+
 
 echo "Debug (wg0_up.sh): 添加新的 IP 规则和路由..."
 # 添加新的路由规则
@@ -358,22 +368,30 @@ iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-m
 ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 # --- 新增的防火墙规则 ---
-echo "Debug (wg0_up.sh): 配置 iptables/ip6tables FORWARD 链规则..."
+echo "Debug (wg0_up.sh): 配置 iptables/ip6tables FORWARD 和 NAT 链规则..."
 
 # 允许已建立和相关连接通过 (非常重要，防止断连)
 iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 # 允许来自 WireGuard 接口 (wg0) 的所有出站流量通过 FORWARD 链
-# 这条规则确保了通过 WireGuard 隧道发出的新连接能够被转发
 iptables -A FORWARD -i wg0 -j ACCEPT
 ip6tables -A FORWARD -i wg0 -j ACCEPT
 
 # 允许目标为 WireGuard 接口 (wg0) 的流量通过 FORWARD 链
-# 这条规则确保了从外部返回到 WireGuard 客户端 IP 的响应流量能够被转发
-# (此场景可能相对较少，主要针对 WireGuard 对端的响应流量)
 iptables -A FORWARD -o wg0 -j ACCEPT
 ip6tables -A FORWARD -o wg0 -j ACCEPT
+
+# 为通过 WireGuard 接口出站的流量设置 NAT (Masquerade)
+# 将来自 wg0 的内部 IP 伪装成 VPS 的公共 IP
+# 这里的 MASQUERADE 规则应该在 PostUp 脚本中，并且针对外部接口
+# 我们需要找到公共 IPv4 和 IPv6 的出站接口
+# 假设 PUBLIC_V4_INTERFACE 和 PUBLIC_V6_INTERFACE_IN_UP 已经被正确获取
+PUBLIC_V4_INTERFACE_IN_UP=\$(ip route get \$PUBLIC_V4_IN_UP | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+echo "Debug (wg0_up.sh): PUBLIC_V4_INTERFACE_IN_UP = \$PUBLIC_V4_INTERFACE_IN_UP"
+
+[ -n "\$PUBLIC_V4_IN_UP" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -A POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE
+[ -n "\$PUBLIC_V6_IN_UP" ] && [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -A POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE
 
 echo "Debug (wg0_up.sh): 路由和防火墙规则应用完成。"
 EOF
@@ -385,12 +403,15 @@ EOF
 #!/usr/bin/env bash
 # 此脚本用于 WireGuard 接口停止后清理路由规则
 
-# 获取服务器当前公网 IP，优先通过路由表获取 (重新检测以避免环境依赖)
+# 获取服务器当前公网 IP 和接口，优先通过路由表获取 (重新检测以避免环境依赖)
 get_public_ips_in_down_script() {
     PUBLIC_V4_IN_DOWN=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$')
     PUBLIC_V6_IN_DOWN=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$')
+    PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+
     [ -z "\$PUBLIC_V4_IN_DOWN" ] && PUBLIC_V4_IN_DOWN=\$(ip -4 addr show | grep 'global' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
     [ -z "\$PUBLIC_V6_IN_DOWN" ] && PUBLIC_V6_IN_DOWN=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
+    [ -z "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$NF}' | head -n 1)
 }
 get_public_ips_in_down_script
 
@@ -411,6 +432,11 @@ iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
 ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
 iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
 ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
+
+# 清理 NAT 规则
+PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip route get \$PUBLIC_V4_IN_DOWN | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+[ -n "\$PUBLIC_V4_IN_DOWN" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && [ -n "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
 
 
 ip rule del table 51820 pref 300 2>/dev/null
