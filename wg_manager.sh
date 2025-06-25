@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='1.0.6' # 版本号更新，主要修复IPv6转发中的NAT问题
+VERSION='1.0.7' # 版本号更新，默认启用wg0_up.sh的调试模式，并增加持久化防火墙工具检查
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -65,8 +65,8 @@ check_dependencies() {
   info "\n检查并安装系统依赖..."
 
   if [ "$SYSTEM" = 'Alpine' ]; then
-    DEPS_CHECK=("ping" "curl" "grep" "bash" "ip" "wget" "resolvconf")
-    DEPS_INSTALL=("iputils-ping" "curl" "grep" "bash" "iproute2" "wget" "openresolv") # Alpine uses openresolv
+    DEPS_CHECK=("ping" "curl" "grep" "bash" "ip" "wget" "resolvconf" "iptables" "ip6tables") # Add iptables/ip6tables check
+    DEPS_INSTALL=("iputils-ping" "curl" "grep" "bash" "iproute2" "wget" "openresolv" "iptables" "iptables") # Add iptables/ip6tables to install list
   else
     DEPS_CHECK=("ping" "wget" "curl" "systemctl" "ip" "resolvconf" "iptables" "ip6tables") # Add iptables/ip6tables check
     DEPS_INSTALL=("iputils-ping" "wget" "curl" "systemctl" "iproute2" "openresolv" "iptables" "iptables") # Add iptables/ip6tables to install list
@@ -120,6 +120,22 @@ check_dependencies() {
       * )
         error "无法为当前操作系统安装 wireguard-tools，请手动安装。"
     esac
+  fi
+
+  # 确保防火墙规则持久化工具安装
+  if [ "$SYSTEM" = 'Debian' ] || [ "$SYSTEM" = 'Ubuntu' ]; then
+    if ! dpkg -s netfilter-persistent >/dev/null 2>&1; then
+      info "安装 netfilter-persistent 以保存防火墙规则..."
+      ${PACKAGE_INSTALL[int]} netfilter-persistent >/dev/null 2>&1 || warning "netfilter-persistent 安装失败，防火墙规则可能无法持久化。"
+      systemctl enable netfilter-persistent >/dev/null 2>&1 || warning "启用 netfilter-persistent 失败。"
+    fi
+  elif [ "$SYSTEM" = 'CentOS' ] || [ "$SYSTEM" = 'Fedora' ]; then
+    if ! rpm -q iptables-services >/dev/null 2>&1; then
+      info "安装 iptables-services 以保存防火墙规则..."
+      ${PACKAGE_INSTALL[int]} iptables-services >/dev/null 2>&1 || warning "iptables-services 安装失败，防火墙规则可能无法持久化。"
+      systemctl enable iptables >/dev/null 2>&1
+      systemctl enable ip6tables >/dev/null 2>&1
+    fi
   fi
 
   PING6='ping -6' && [ -x "$(type -p ping6)" ] && PING6='ping6'
@@ -249,8 +265,8 @@ EOF
 #!/usr/bin/env bash
 # 此脚本用于 WireGuard 接口启动后配置路由规则
 
-# 启用调试模式 (取消注释 'set -x' 以查看详细执行过程)
-# set -x
+# 默认启用调试模式 (方便排查问题)
+set -x
 
 # 获取服务器当前公网 IP 和接口，优先通过路由表获取 (重新检测以避免环境依赖)
 get_public_ips_in_up_script() {
@@ -334,7 +350,8 @@ iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-m
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 
 # 清理旧的 NAT 规则（如果存在）
-[ -n "\$PUBLIC_V4_IN_UP" ] && iptables -t nat -D POSTROUTING -o \$(ip route get \$PUBLIC_V4_IN_UP | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}') -j MASQUERADE 2>/dev/null
+PUBLIC_V4_INTERFACE_IN_UP_CLEAN=\$(ip route get \$PUBLIC_V4_IN_UP 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+[ -n "\$PUBLIC_V4_IN_UP" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_UP_CLEAN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP_CLEAN -j MASQUERADE 2>/dev/null
 [ -n "\$PUBLIC_V6_IN_UP" ] && [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
 
 
@@ -384,13 +401,11 @@ ip6tables -A FORWARD -o wg0 -j ACCEPT
 
 # 为通过 WireGuard 接口出站的流量设置 NAT (Masquerade)
 # 将来自 wg0 的内部 IP 伪装成 VPS 的公共 IP
-# 这里的 MASQUERADE 规则应该在 PostUp 脚本中，并且针对外部接口
 # 我们需要找到公共 IPv4 和 IPv6 的出站接口
-# 假设 PUBLIC_V4_INTERFACE 和 PUBLIC_V6_INTERFACE_IN_UP 已经被正确获取
-PUBLIC_V4_INTERFACE_IN_UP=\$(ip route get \$PUBLIC_V4_IN_UP | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
-echo "Debug (wg0_up.sh): PUBLIC_V4_INTERFACE_IN_UP = \$PUBLIC_V4_INTERFACE_IN_UP"
+PUBLIC_V4_INTERFACE_IN_UP_FINAL=\$(ip route get \$PUBLIC_V4_IN_UP 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+echo "Debug (wg0_up.sh): PUBLIC_V4_INTERFACE_IN_UP_FINAL = \$PUBLIC_V4_INTERFACE_IN_UP_FINAL"
 
-[ -n "\$PUBLIC_V4_IN_UP" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -A POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE
+[ -n "\$PUBLIC_V4_IN_UP" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_UP_FINAL" ] && iptables -t nat -A POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP_FINAL -j MASQUERADE
 [ -n "\$PUBLIC_V6_IN_UP" ] && [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -A POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE
 
 echo "Debug (wg0_up.sh): 路由和防火墙规则应用完成。"
@@ -434,8 +449,8 @@ iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
 ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
 
 # 清理 NAT 规则
-PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip route get \$PUBLIC_V4_IN_DOWN | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
-[ -n "\$PUBLIC_V4_IN_DOWN" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
+PUBLIC_V4_INTERFACE_IN_DOWN_CLEAN=\$(ip route get \$PUBLIC_V4_IN_DOWN 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+[ -n "\$PUBLIC_V4_IN_DOWN" ] && [ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN_CLEAN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN_CLEAN -j MASQUERADE 2>/dev/null
 [ -n "\$PUBLIC_V6_IN_DOWN" ] && [ -n "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
 
 
