@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 当前脚本版本号
-VERSION='1.0.8' # 版本号更新，修复wg0_up.sh中公共接口检测错误
+VERSION='1.0.9' # 版本号更新，增加对UFW防火墙的兼容性处理
 
 # 环境变量用于在Debian或Ubuntu操作系统中设置非交互式（noninteractive）安装模式
 export DEBIAN_FRONTEND=noninteractive
@@ -68,8 +68,8 @@ check_dependencies() {
     DEPS_CHECK=("ping" "curl" "grep" "bash" "ip" "wget" "resolvconf" "iptables" "ip6tables") # Add iptables/ip6tables check
     DEPS_INSTALL=("iputils-ping" "curl" "grep" "bash" "iproute2" "wget" "openresolv" "iptables" "iptables") # Add iptables/ip6tables to install list
   else
-    DEPS_CHECK=("ping" "wget" "curl" "systemctl" "ip" "resolvconf" "iptables" "ip6tables") # Add iptables/ip6tables check
-    DEPS_INSTALL=("iputils-ping" "wget" "curl" "systemctl" "iproute2" "openresolv" "iptables" "iptables") # Add iptables/ip6tables to install list
+    DEPS_CHECK=("ping" "wget" "curl" "systemctl" "ip" "resolvconf" "iptables" "ip6tables" "ufw") # Add iptables/ip6tables and ufw check
+    DEPS_INSTALL=("iputils-ping" "wget" "curl" "systemctl" "iproute2" "openresolv" "iptables" "iptables" "ufw") # Add iptables/ip6tables and ufw to install list
   fi
 
   local DEPS_TO_INSTALL=()
@@ -204,6 +204,25 @@ install_custom_wireguard() {
       warning "未检测到原生公共 IPv6 地址，跳过 IPv6 转发配置。"
   fi
   sysctl -p /etc/sysctl.d/99-wireguard-forwarding.conf >/dev/null 2>&1 || warning "应用 sysctl 配置失败，请手动检查 /etc/sysctl.d/99-wireguard-forwarding.conf。"
+
+
+  # 处理 UFW 防火墙规则
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+      info "检测到 UFW 处于活动状态，正在配置 UFW 规则..."
+      # 允许 WireGuard 接口的流量转发
+      ufw allow in on wg0 comment 'Allow WireGuard inbound traffic'
+      ufw allow out on wg0 comment 'Allow WireGuard outbound traffic'
+      # 允许 WireGuard 端口 UDP 流量
+      # 此处假设 WireGuard 监听端口为 51820 (如果您配置了不同的端口，请修改)
+      local ENDPOINT_PORT=$(echo "$ENDPOINT" | awk -F':' '{print $NF}')
+      ufw allow $ENDPOINT_PORT/udp comment "Allow WireGuard UDP traffic"
+      # 允许转发策略从 DROP 改为 ACCEPT (如果默认是 DROP)
+      sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+      ufw reload >/dev/null 2>&1 || warning "UFW 重载失败，请手动检查。"
+      info "UFW 规则已配置。请注意，如果您之前有其他严格的 UFW 规则，可能需要手动调整以允许相关流量。"
+  else
+      info "未检测到 UFW 或 UFW 未启用，跳过 UFW 配置。"
+  fi
 
 
   # 创建 WireGuard 配置文件
@@ -358,14 +377,6 @@ ip rule del table 51820 pref 300 2>/dev/null # 删除兜底规则，重新添加
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 
-# 清理旧的 FORWARD 规则
-iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
-iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
-
 # 清理旧的 NAT 规则（如果存在）
 # 使用获取到的接口变量进行清理，确保准确性
 [ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
@@ -401,20 +412,8 @@ ip rule add table 51820 pref 300
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# --- 配置防火墙 FORWARD 和 NAT 链规则 ---
-echo "Debug (wg0_up.sh): 配置 iptables/ip6tables FORWARD 和 NAT 链规则..."
-
-# 允许已建立和相关连接通过 (非常重要，防止断连)
-iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-
-# 允许来自 WireGuard 接口 (wg0) 的所有出站流量通过 FORWARD 链
-iptables -A FORWARD -i wg0 -j ACCEPT
-ip6tables -A FORWARD -i wg0 -j ACCEPT
-
-# 允许目标为 WireGuard 接口 (wg0) 的流量通过 FORWARD 链 (针对返回的流量)
-iptables -A FORWARD -o wg0 -j ACCEPT
-ip6tables -A FORWARD -o wg0 -j ACCEPT
+# --- 配置防火墙 NAT 链规则 (UFW现在处理FORWARD链) ---
+echo "Debug (wg0_up.sh): 配置 iptables/ip6tables NAT 链规则 (FORWARD链由UFW管理)..."
 
 # 为通过 WireGuard 接口出站的流量设置 NAT (Masquerade)
 # 将来自 wg0 的内部 IP 伪装成 VPS 的公共 IP
@@ -475,14 +474,6 @@ WG_LOCAL_V4=\$(ip addr show wg0 | grep "inet\b" | awk '{print \$2}' | cut -d / -
 # 删除自定义路由表规则 (确保删除顺序正确，与 PostUp 相反)
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-
-# --- 清理新增的防火墙规则 ---
-iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
-iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null
 
 # 清理 NAT 规则
 [ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
@@ -605,6 +596,23 @@ uninstall_wireguard() {
   rm -f /etc/sysctl.d/99-wireguard-forwarding.conf
   sysctl --system >/dev/null 2>&1 # 重新加载所有 sysctl 配置，移除此脚本添加的转发规则
 
+  # 清理 UFW 规则
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+      info "正在清理 UFW 规则..."
+      # 移除 WireGuard 接口的流量转发规则
+      ufw delete allow in on wg0 comment 'Allow WireGuard inbound traffic' 2>/dev/null
+      ufw delete allow out on wg0 comment 'Allow WireGuard outbound traffic' 2>/dev/null
+      # 移除 WireGuard UDP 端口规则
+      local ENDPOINT_PORT=$(echo "$ENDPOINT" | awk -F':' '{print $NF}')
+      ufw delete allow $ENDPOINT_PORT/udp comment "Allow WireGuard UDP traffic" 2>/dev/null
+      # 恢复 UFW 的转发策略 (如果之前是 DROP)
+      # 注意：这里不能简单地设回DROP，因为用户可能还有其他需要转发的流量
+      # 最安全的做法是提示用户手动检查或不修改
+      # sed -i 's/DEFAULT_FORWARD_POLICY="ACCEPT"/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw # 不建议自动改回
+      ufw reload >/dev/null 2>&1 || warning "UFW 重载失败，请手动检查。"
+      info "UFW 规则已清理。请手动检查 /etc/default/ufw 中的 DEFAULT_FORWARD_POLICY。"
+  fi
+
   # 尝试卸载 wireguard-tools 依赖 (可选，但为了清理)
   reading "是否卸载 wireguard-tools 软件包？ (y/N): " UNINSTALL_DEPS_CONFIRM
   if [[ "${UNINSTALL_DEPS_CONFIRM,,}" = "y" ]]; then
@@ -669,9 +677,6 @@ menu() {
       ;;
     3)
       toggle_wireguard
-      ;;
-    4)
-      uninstall_wireguard
       ;;
     0)
       info "退出脚本。再见！"
