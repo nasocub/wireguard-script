@@ -266,7 +266,7 @@ EOF
       echo "AllowedIPs = ::/0" >> /etc/wireguard/wg0.conf
   fi
 
-  [ -n "$PRESHARED_KEY" ] && echo "PresharedKey = $PRESHARED_KEY" >> /etc/wireguard/wg0.conf
+  [ -n "$PRESHARED_KEY" ] && echo "PresharedKey = $PRESHARED_K`EY" >> /etc/wireguard/wg0.conf
   [ -n "$PERSISTENT_KEEPALIVE" ] && echo "PersistentKeepalive = $PERSISTENT_KEEPALIVE" >> /etc/wireguard/wg0.conf
 
   chmod 600 /etc/wireguard/wg0.conf
@@ -283,9 +283,9 @@ EOF
 #!/usr/bin/env bash
 # This script configures routing rules after the WireGuard interface starts
 
-# Removed 'set -x' by default to reduce verbose output during normal operation.
-# To enable debugging, uncomment the line below:
+# Enable debugging if needed. Uncomment the line below:
 # set -x
+set -e # Exit immediately if a command exits with a non-zero status.
 
 # Get server's current public IP and interface
 get_public_ips_in_up_script() {
@@ -332,6 +332,11 @@ while [ -z "\$WG_LOCAL_V4" ] && [ \$ATTEMPTS -lt \$MAX_ATTEMPTS ]; do
     fi
 done
 
+if [ -z "\$WG_LOCAL_V4" ]; then
+    echo "Error (wg0_up.sh): Failed to get wg0's IPv4 address after multiple attempts. WireGuard might not have started correctly or timed out." >&2
+    exit 1
+fi
+
 # Only attempt to get WG_LOCAL_V6 if a public IPv6 is detected on the VPS
 if [ -n "\$PUBLIC_V6_IN_UP" ]; then
     ATTEMPTS=0 # Reset attempts
@@ -348,15 +353,16 @@ if [ -n "\$PUBLIC_V6_IN_UP" ]; then
             ATTEMPTS=\$((ATTEMPTS+1))
         fi
     done
+
+    if [ -z "\$WG_LOCAL_V6" ]; then
+        echo "Warning (wg0_up.sh): Failed to get wg0's IPv6 address after multiple attempts. IPv6 routing via WireGuard may not work." >&2
+    fi
 fi
+
 
 echo "Debug (wg0_up.sh): WG_LOCAL_V4 = \$WG_LOCAL_V4"
 echo "Debug (wg0_up.sh): WG_LOCAL_V6 = \$WG_LOCAL_V6"
 
-if [ -z "\$WG_LOCAL_V4" ]; then
-    echo "Error (wg0_up.sh): Failed to get wg0's IPv4 address, WireGuard might not have started correctly or timed out." >&2
-    exit 1
-fi
 
 # Define custom routing table 51820
 # (Add if not exists, avoid errors from duplicate additions)
@@ -398,11 +404,13 @@ ip rule add table main suppress_prefixlength 0 pref 50
 # 3. Route traffic from WireGuard interface's local IP to the custom table
 # This ensures that services inside the WireGuard tunnel can egress normally
 [ -n "\$WG_LOCAL_V4" ] && ip -4 rule add from \$WG_LOCAL_V4 lookup 51820 pref 200
+# Only add IPv6 rule if WG_LOCAL_V6 was successfully obtained
 [ -n "\$WG_LOCAL_V6" ] && ip -6 rule add from \$WG_LOCAL_V6 lookup 51820 pref 200
 
 # 4. Define the default route for custom table 51820, through the WireGuard interface
 # This is the WireGuard egress point
 ip -4 route add default dev wg0 table 51820
+# Only add IPv6 route if WG_LOCAL_V6 was successfully obtained
 [ -n "\$WG_LOCAL_V6" ] && ip -6 route add default dev wg0 table 51820
 
 # 5. (Lowest priority) Fallback rule: all traffic not matched by previous rules is routed to custom table 51820
@@ -413,19 +421,36 @@ ip rule add table 51820 pref 300
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# --- Configure firewall NAT chain rules (UFW now handles FORWARD chain) ---
-echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules (FORWARD chain managed by UFW)..."
+# --- Configure firewall FORWARD chain rules explicitly (complementing UFW) ---
+echo "Debug (wg0_up.sh): Configuring iptables/ip6tables FORWARD chain rules explicitly..."
+
+# Allow established and related connections for both IPv4 and IPv6
+iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Allow traffic from wg0 interface to anywhere
+iptables -A FORWARD -i wg0 -j ACCEPT
+ip6tables -A FORWARD -i wg0 -j ACCEPT
+
+# Allow traffic from other interfaces to wg0 (e.g., if you have other internal networks that need to use WG)
+# This might be less critical for a client-side setup but good for a server.
+# For simplicity, we assume traffic originates from the server itself.
+
+# --- Configure firewall NAT chain rules ---
+echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules..."
 
 # Set up NAT (Masquerade) for outbound traffic through WireGuard interface
 # Masquerade internal IPs from wg0 as the VPS's public IP
 [ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -A POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE
+# Ensure PUBLIC_V6_INTERFACE_IN_UP is available for IPv6 NAT
 [ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -A POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE
 
+
 # Additional debug: display current routing tables and rules
-echo "Debug (wg0_up.sh): Current IPv4 routing tables (main and 51820):"
+echo "Debug (wg0_up.sh): Current IPv4 routing table (main and 51820):"
 ip -4 route show table main
 ip -4 route show table 51820
-echo "Debug (wg0_up.sh): Current IPv6 routing tables (main and 51820):"
+echo "Debug (wg0_up.sh): Current IPv6 routing table (main and 51820):"
 ip -6 route show table main
 ip -6 route show table 51820
 echo "Debug (wg0_up.sh): Current IP rules:"
@@ -451,6 +476,7 @@ EOF
 
 # Removed 'set -x' by default. Uncomment for debugging:
 # set -x
+set -e # Exit immediately if a command exits with a non-zero status.
 
 # Get server's current public IP and interface
 get_public_ips_in_down_script() {
@@ -482,6 +508,12 @@ ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-
 # Clean up NAT rules
 [ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
 [ -n "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
+
+# Clean up explicit FORWARD chain rules
+iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
+ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
 
 
 ip rule del table 51820 pref 300 2>/dev/null
