@@ -678,6 +678,9 @@ menu() {
     3)
       toggle_wireguard
       ;;
+    4) # <-- 新增：处理选项 4
+      uninstall_wireguard
+      ;;
     0)
       info "退出脚本。再见！"
       exit 0
