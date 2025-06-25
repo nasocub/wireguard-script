@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Current script version number
-VERSION='1.0.10' # Version updated, fixed UFW port cleanup issue during uninstallation
+VERSION='1.0.11' # Version updated for IPv6 debugging and robustness improvements
 
 # Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
@@ -283,12 +283,15 @@ EOF
 #!/usr/bin/env bash
 # This script configures routing rules after the WireGuard interface starts
 
-# Enable debugging if needed. Uncomment the line below:
-# set -x
+# Enable debugging. Uncomment the line below for verbose output:
+set -x
 set -e # Exit immediately if a command exits with a non-zero status.
+
+echo "--- Debugging wg0_up.sh ---"
 
 # Get server's current public IP and interface
 get_public_ips_in_up_script() {
+    echo "Debug: Getting public IPs and interfaces..."
     # Get the main outbound interface by querying the default route
     PUBLIC_V4_INTERFACE_IN_UP=\$(ip -4 route | grep default | awk '{print \$5; exit}')
     PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route | grep default | awk '{print \$5; exit}')
@@ -326,7 +329,7 @@ echo "Debug (wg0_up.sh): Waiting for wg0 interface to get IP addresses..."
 while [ -z "\$WG_LOCAL_V4" ] && [ \$ATTEMPTS -lt \$MAX_ATTEMPTS ]; do
     WG_LOCAL_V4=\$(ip addr show wg0 | grep "inet\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
     if [ -z "\$WG_LOCAL_V4" ]; then
-        echo "Debug (wg0_up.sh): Attempt \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv4 address not ready, waiting \$SLEEP_INTERVAL seconds..."
+        echo "Debug (wg0_up.sh): Attempt \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv4 address not ready on wg0. Waiting \$SLEEP_INTERVAL seconds..."
         sleep \$SLEEP_INTERVAL
         ATTEMPTS=\$((ATTEMPTS+1))
     fi
@@ -348,7 +351,7 @@ if [ -n "\$PUBLIC_V6_IN_UP" ]; then
         fi
 
         if [ -z "\$WG_LOCAL_V6" ]; then
-            echo "Debug (wg0_up.sh): Attempt \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv6 address not ready, waiting \$SLEEP_INTERVAL seconds..."
+            echo "Debug (wg0_up.sh): Attempt \$((ATTEMPTS+1))/\$MAX_ATTEMPTS: IPv6 address not ready on wg0. Waiting \$SLEEP_INTERVAL seconds..."
             sleep \$SLEEP_INTERVAL
             ATTEMPTS=\$((ATTEMPTS+1))
         fi
@@ -357,37 +360,40 @@ if [ -n "\$PUBLIC_V6_IN_UP" ]; then
     if [ -z "\$WG_LOCAL_V6" ]; then
         echo "Warning (wg0_up.sh): Failed to get wg0's IPv6 address after multiple attempts. IPv6 routing via WireGuard may not work." >&2
     fi
+else
+    echo "Debug (wg0_up.sh): No native public IPv6 detected on VPS, skipping wg0 IPv6 address acquisition."
 fi
 
 
-echo "Debug (wg0_up.sh): WG_LOCAL_V4 = \$WG_LOCAL_V4"
-echo "Debug (wg0_up.sh): WG_LOCAL_V6 = \$WG_LOCAL_V6"
+echo "Debug (wg0_up.sh): Final WG_LOCAL_V4 = \$WG_LOCAL_V4"
+echo "Debug (wg0_up.sh): Final WG_LOCAL_V6 = \$WG_LOCAL_V6"
 
 
 # Define custom routing table 51820
 # (Add if not exists, avoid errors from duplicate additions)
+echo "Debug (wg0_up.sh): Adding/verifying custom routing table 'wg_custom' (51820)..."
 grep -q '51820\s\+wg_custom' /etc/iproute2/rt_tables || echo '51820       wg_custom' >> /etc/iproute2/rt_tables
 
 # Clean up potentially existing old rules to ensure idempotency
 echo "Debug (wg0_up.sh): Cleaning up old IP rules and routes..."
-ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null
-ip rule del table 51820 suppress_prefixlength 0 2>/dev/null
-[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null
-[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 lookup 51820 pref 200 2>/dev/null
-ip -4 route del default dev wg0 table 51820 2>/dev/null
-[ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null
-[ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule del from \$PUBLIC_V4_IN_UP lookup main pref 100 2>/dev/null
-[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule del from \$PUBLIC_V6_IN_UP lookup main pref 100 2>/dev/null
-ip rule del table 51820 pref 300 2>/dev/null # Delete fallback rule, re-add to ensure order
+ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null || true
+ip rule del table 51820 suppress_prefixlength 0 2>/dev/null || true
+[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null || true
+[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 lookup 51820 pref 200 2>/dev/null || true
+ip -4 route del default dev wg0 table 51820 2>/dev/null || true
+[ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null || true
+[ -n "\$PUBLIC_V4_IN_UP" ] && ip -4 rule del from \$PUBLIC_V4_IN_UP lookup main pref 100 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_UP" ] && ip -6 rule del from \$PUBLIC_V6_IN_UP lookup main pref 100 2>/dev/null || true
+ip rule del table 51820 pref 300 2>/dev/null || true # Delete fallback rule, re-add to ensure order
 
 # Clean up potentially existing TCPMSS rules in mangle table
-iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 # Clean up old NAT rules (if they exist)
-# Use the fetched interface variables for cleanup to ensure accuracy
-[ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
-[ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null
+echo "Debug (wg0_up.sh): Cleaning up old NAT rules..."
+[ -n "\$PUBLIC_V4_INTERFACE_IN_UP" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null || true
+[ -n "\$PUBLIC_V6_INTERFACE_IN_UP" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_UP -j MASQUERADE 2>/dev/null || true
 
 
 echo "Debug (wg0_up.sh): Adding new IP rules and routes..."
@@ -418,6 +424,7 @@ ip -4 route add default dev wg0 table 51820
 ip rule add table 51820 pref 300
 
 # TCP MSS Clamping, performance optimization
+echo "Debug (wg0_up.sh): Adding TCP MSS clamping rules..."
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
@@ -431,10 +438,6 @@ ip6tables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 # Allow traffic from wg0 interface to anywhere
 iptables -A FORWARD -i wg0 -j ACCEPT
 ip6tables -A FORWARD -i wg0 -j ACCEPT
-
-# Allow traffic from other interfaces to wg0 (e.g., if you have other internal networks that need to use WG)
-# This might be less critical for a client-side setup but good for a server.
-# For simplicity, we assume traffic originates from the server itself.
 
 # --- Configure firewall NAT chain rules ---
 echo "Debug (wg0_up.sh): Configuring iptables/ip6tables NAT chain rules..."
@@ -464,7 +467,7 @@ ip6tables -nvL FORWARD
 echo "Debug (wg0_up.sh): Current ip6tables NAT POSTROUTING chain rules:"
 ip6tables -t nat -nvL POSTROUTING
 
-echo "Debug (wg0_up.sh): Routing and firewall rules applied."
+echo "--- wg0_up.sh Debugging Complete ---"
 EOF
 
   chmod +x /etc/wireguard/wg0_up.sh
@@ -474,12 +477,15 @@ EOF
 #!/usr/bin/env bash
 # This script cleans up routing rules after the WireGuard interface stops
 
-# Removed 'set -x' by default. Uncomment for debugging:
+# Enable debugging. Uncomment the line below for verbose output:
 # set -x
 set -e # Exit immediately if a command exits with a non-zero status.
 
+echo "--- Debugging wg0_down.sh ---"
+
 # Get server's current public IP and interface
 get_public_ips_in_down_script() {
+    echo "Debug: Getting public IPs and interfaces for cleanup..."
     PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 route | grep default | awk '{print \$5; exit}')
     PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route | grep default | awk '{print \$5; exit}')
 
@@ -494,45 +500,59 @@ get_public_ips_in_down_script() {
 }
 get_public_ips_in_down_script
 
+echo "Debug (wg0_down.sh): PUBLIC_V4_INTERFACE_IN_DOWN = \$PUBLIC_V4_INTERFACE_IN_DOWN"
+echo "Debug (wg0_down.sh): PUBLIC_V6_INTERFACE_IN_DOWN = \$PUBLIC_V6_INTERFACE_IN_DOWN"
+echo "Debug (wg0_down.sh): PUBLIC_V4_IN_DOWN = \$PUBLIC_V4_IN_DOWN"
+echo "Debug (wg0_down.sh): PUBLIC_V6_IN_DOWN = \$PUBLIC_V6_IN_DOWN"
+
 
 # Get WireGuard interface IPs (might be invalid, but attempt to get for old rule cleanup)
 WG_LOCAL_V4=\$(ip addr show wg0 | grep "inet\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
 # Only attempt to get wg0's local IPv6 address if VPS has native IPv6
 [ -n "\$PUBLIC_V6_IN_DOWN" ] && WG_LOCAL_V6=\$(ip addr show wg0 | grep "inet6\b" | awk '{print \$2}' | cut -d / -f 1 | head -n 1)
+echo "Debug (wg0_down.sh): WG_LOCAL_V4 (for cleanup) = \$WG_LOCAL_V4"
+echo "Debug (wg0_down.sh): WG_LOCAL_V6 (for cleanup) = \$WG_LOCAL_V6"
 
 
 # Delete custom routing table rules (ensure correct deletion order, inverse of PostUp)
-iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+echo "Debug (wg0_down.sh): Deleting TCP MSS clamping rules..."
+iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 # Clean up NAT rules
-[ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
-[ -n "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null
+echo "Debug (wg0_down.sh): Cleaning up NAT rules..."
+[ -n "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && iptables -t nat -D POSTROUTING -o \$PUBLIC_V4_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null || true
+[ -n "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && ip6tables -t nat -D POSTROUTING -o \$PUBLIC_V6_INTERFACE_IN_DOWN -j MASQUERADE 2>/dev/null || true
 
 # Clean up explicit FORWARD chain rules
-iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
-ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null
+echo "Debug (wg0_down.sh): Cleaning up explicit FORWARD rules..."
+iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+ip6tables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+ip6tables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
 
 
-ip rule del table 51820 pref 300 2>/dev/null
+echo "Debug (wg0_down.sh): Deleting custom IP rules and routes..."
+ip rule del table 51820 pref 300 2>/dev/null || true
 
-ip -4 route del default dev wg0 table 51820 2>/dev/null
-[ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null
+ip -4 route del default dev wg0 table 51820 2>/dev/null || true
+[ -n "\$WG_LOCAL_V6" ] && ip -6 route del default dev wg0 table 51820 2>/dev/null || true
 
-[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null
-[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 lookup 51820 pref 200 2>/dev/null
+[ -n "\$WG_LOCAL_V4" ] && ip -4 rule del from \$WG_LOCAL_V4 lookup 51820 pref 200 2>/dev/null || true
+[ -n "\$WG_LOCAL_V6" ] && ip -6 rule del from \$WG_LOCAL_V6 lookup 51820 pref 200 2>/dev/null || true
 
-[ -n "\$PUBLIC_V4_IN_DOWN" ] && ip -4 rule del from \$PUBLIC_V4_IN_DOWN lookup main pref 100 2>/dev/null
-[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip -6 rule del from \$PUBLIC_V6_IN_DOWN lookup main pref 100 2>/dev/null
+[ -n "\$PUBLIC_V4_IN_DOWN" ] && ip -4 rule del from \$PUBLIC_V4_IN_DOWN lookup main pref 100 2>/dev/null || true
+[ -n "\$PUBLIC_V6_IN_DOWN" ] && ip -6 rule del from \$PUBLIC_V6_IN_DOWN lookup main pref 100 2>/dev/null || true
 
-ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null
-ip rule del table 51820 suppress_prefixlength 0 2>/dev/null
+ip rule del table main suppress_prefixlength 0 pref 50 2>/dev/null || true
+ip rule del table 51820 suppress_prefixlength 0 2>/dev/null || true
 
 
 # Delete custom routing table name
-sed -i '/51820\s\+wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null
+echo "Debug (wg0_down.sh): Deleting 'wg_custom' (51820) from rt_tables..."
+sed -i '/51820\s\+wg_custom/d' /etc/iproute2/rt_tables 2>/dev/null || true
+
+echo "--- wg0_down.sh Debugging Complete ---"
 EOF
 
   chmod +x /etc/wireguard/wg0_down.sh
@@ -573,9 +593,17 @@ get_status() {
     info "Outbound IP via wg0 tunnel (if successful):"
     # Ensure curl uses the wg0 interface for these checks
     curl -s4 --interface wg0 ipinfo.io/ip || echo "  (IPv4 not obtained or not via wg0 tunnel)"
+
+    # Check if wg0 has an IPv6 address before attempting curl -s6
+    local WG_HAS_IPV6=$(ip -6 addr show wg0 | grep "inet6\b" | grep -v 'fe80::' | awk '{print $2}' | cut -d/ -f1 | head -n 1)
     if [ -n "$PUBLIC_V6" ]; then # Only attempt to detect IPv6 tunnel if VPS has native IPv6
-        # Add timeout to curl -s6 command to avoid long waits
-        curl -s6 --interface wg0 --max-time 10 ipinfo.io/ip || echo "  (IPv6 not obtained or not via wg0 tunnel)"
+        if [ -n "$WG_HAS_IPV6" ]; then
+            info "  wg0 interface has IPv6: $WG_HAS_IPV6"
+            # Add timeout to curl -s6 command to avoid long waits
+            curl -s6 --interface wg0 --max-time 10 ipinfo.io/ip || echo "  (IPv6 not obtained via wg0 tunnel. Check routing/firewall.)"
+        else
+            echo "  (wg0 interface does not have a non-link-local IPv6 address, skipping tunnel IPv6 detection)"
+        fi
     else
         echo "  (VPS did not detect native IPv6, skipping tunnel IPv6 detection)"
     fi
