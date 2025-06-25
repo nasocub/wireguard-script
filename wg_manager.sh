@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Current script version number
-VERSION='1.0.16' # Version updated with improved error logging for service startup
+VERSION='1.0.17' # Version updated to handle IP detection failure during startup
 
 # Environment variable for non-interactive installation mode in Debian or Ubuntu
 export DEBIAN_FRONTEND=noninteractive
@@ -302,9 +302,9 @@ echo "--- Debugging wg0_up.sh ---"
 # Get server's current public IP and interface
 get_public_ips_in_up_script() {
     echo "Debug: Getting public IPs and interfaces..."
-    # Attempt to get public IPs using ip route get, which is usually accurate for active routes
-    PUBLIC_V4_IN_UP=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$')
-    PUBLIC_V6_IN_UP=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$')
+    # Attempt to get public IPs using ip route get. Add '|| true' to prevent script exit on failure.
+    PUBLIC_V4_IN_UP=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$' || true)
+    PUBLIC_V6_IN_UP=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$' || true)
 
     # Fallback for public IPs if ip route get doesn't work (e.g., no default route, or specific network configs)
     [ -z "\$PUBLIC_V4_IN_UP" ] && PUBLIC_V4_IN_UP=\$(ip -4 addr show | grep 'global' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
@@ -319,7 +319,7 @@ get_public_ips_in_up_script() {
     # Now, try to get the interfaces using the identified public IPs (more robust)
     PUBLIC_V4_INTERFACE_IN_UP=""
     if [ -n "\$PUBLIC_V4_IN_UP" ]; then
-        PUBLIC_V4_INTERFACE_IN_UP=\$(ip route get "\$PUBLIC_V4_IN_UP" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        PUBLIC_V4_INTERFACE_IN_UP=\$(ip route get "\$PUBLIC_V4_IN_UP" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}' || true)
         [ -z "\$PUBLIC_V4_INTERFACE_IN_UP" ] && PUBLIC_V4_INTERFACE_IN_UP=\$(ip -4 addr show | grep "\$PUBLIC_V4_IN_UP" | awk '{print \$NF}' | head -n 1)
         if [ -z "\$PUBLIC_V4_INTERFACE_IN_UP" ]; then
             echo "Warning (wg0_up.sh): Could not determine the public IPv4 interface for NAT. IPv4 masquerading may not work correctly." >&2
@@ -328,7 +328,7 @@ get_public_ips_in_up_script() {
 
     PUBLIC_V6_INTERFACE_IN_UP=""
     if [ -n "\$PUBLIC_V6_IN_UP" ]; then
-        PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route get "\$PUBLIC_V6_IN_UP" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 route get "\$PUBLIC_V6_IN_UP" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}' || true)
         [ -z "\$PUBLIC_V6_INTERFACE_IN_UP" ] && PUBLIC_V6_INTERFACE_IN_UP=\$(ip -6 addr show | grep "\$PUBLIC_V6_IN_UP" | awk '{print \$NF}' | head -n 1)
         if [ -z "\$PUBLIC_V6_INTERFACE_IN_UP" ]; then
             echo "Warning (wg0_up.sh): Could not determine the public IPv6 interface for NAT. IPv6 masquerading may not work correctly." >&2
@@ -528,23 +528,23 @@ echo "--- Debugging wg0_down.sh ---"
 # Get server's current public IP and interface
 get_public_ips_in_down_script() {
     echo "Debug: Getting public IPs and interfaces for cleanup..."
-    PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 route | grep default | awk '{print \$5; exit}')
-    PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route | grep default | awk '{print \$5; exit}')
+    PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 route | grep default | awk '{print \$5; exit}' || true)
+    PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route | grep default | awk '{print \$5; exit}' || true)
 
-    PUBLIC_V4_IN_DOWN=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$')
-    PUBLIC_V6_IN_DOWN=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$')
+    PUBLIC_V4_IN_DOWN=\$(ip route get 8.8.8.8 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9]{1,3}\.){3}[0-9]{1,3}\$' || true)
+    PUBLIC_V6_IN_DOWN=\$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{print \$NF; exit}' | grep -Eo '^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\$' || true)
 
     [ -z "\$PUBLIC_V4_IN_DOWN" ] && PUBLIC_V4_IN_DOWN=\$(ip -4 addr show | grep 'global' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
     [ -z "\$PUBLIC_V6_IN_DOWN" ] && PUBLIC_V6_IN_DOWN=\$(ip -6 addr show | grep 'global' | grep -v 'fe80::' | awk '{print \$2}' | cut -d/ -f1 | head -n 1)
 
     # Now, try to get the interfaces using the identified public IPs (more robust)
     if [ -n "\$PUBLIC_V4_IN_DOWN" ]; then
-        PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip route get "\$PUBLIC_V4_IN_DOWN" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip route get "\$PUBLIC_V4_IN_DOWN" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}' || true)
         [ -z "\$PUBLIC_V4_INTERFACE_IN_DOWN" ] && PUBLIC_V4_INTERFACE_IN_DOWN=\$(ip -4 addr show | grep "\$PUBLIC_V4_IN_DOWN" | awk '{print \$NF}' | head -n 1)
     fi
 
     if [ -n "\$PUBLIC_V6_IN_DOWN" ]; then
-        PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route get "\$PUBLIC_V6_IN_DOWN" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}')
+        PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 route get "\$PUBLIC_V6_IN_DOWN" 2>/dev/null | awk '{for(i=1;i<=NF;++i) if (\$i=="dev") { print \$(i+1); exit; }}' || true)
         [ -z "\$PUBLIC_V6_INTERFACE_IN_DOWN" ] && PUBLIC_V6_INTERFACE_IN_DOWN=\$(ip -6 addr show | grep "\$PUBLIC_V6_IN_DOWN" | awk '{print \$NF}' | head -n 1)
     fi
 }
