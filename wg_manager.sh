@@ -2,8 +2,9 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.2
+# 版本: 1.3
 # 更新日志:
+# v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能，解决 "IPv6 is disabled" 错误。
 # v1.2: 修复了在OpenVZ/LXC等容器化环境中因权限不足导致IP地址分配失败的问题。
 # v1.1: 修复了在部分系统中因缺少 `resolvconf` 依赖而启动失败的问题。
 #
@@ -94,6 +95,23 @@ check_dependencies() {
     fi
 }
 
+# [v1.3 新增] 启用系统级IPv6支持
+enable_ipv6() {
+    if [ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
+        if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" -eq 1 ]; then
+            info "检测到系统已禁用IPv6，正在为您启用..."
+            sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
+            sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
+            sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
+            echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
+            echo "net.ipv6.conf.default.disable_ipv6 = 0" >> /etc/sysctl.conf
+            echo "net.ipv6.conf.lo.disable_ipv6 = 0" >> /etc/sysctl.conf
+            sysctl -p >/dev/null 2>&1
+            info "系统级IPv6已启用。"
+        fi
+    fi
+}
+
 # 2. 获取用户输入的WireGuard配置
 manual_input_config() {
     hint "\n--- 请输入您的 WireGuard [Interface] 配置 ---\n"
@@ -129,6 +147,11 @@ install_wg() {
     info "正在生成 WireGuard 配置文件..."
     manual_input_config
 
+    # [v1.3] 如果配置中包含IPv6地址，则确保系统启用IPv6
+    if [[ "$WG_ADDRESS" == *":"* ]] || [[ "$PEER_ALLOWED_IPS" == *":"* ]]; then
+        enable_ipv6
+    fi
+    
     # 获取服务器主网卡IP
     LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
     LAN6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1)
@@ -136,7 +159,6 @@ install_wg() {
     mkdir -p /etc/wireguard
     
     # 写入基础配置
-    # [v1.2] 不再直接写入Address，将其移至PostUp
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
@@ -147,8 +169,7 @@ EOF
     POSTUP_RULES=""
     POSTDOWN_RULES=""
     
-    # [v1.2] 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
-    # 将用户输入的地址（可能多个）分割并添加到PostUp/PostDown
+    # 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
     IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
     for addr in "${ADDRS[@]}"; do
         # 去除可能存在的前后空格
@@ -286,7 +307,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.2"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.3"
     echo "=============================================="
     hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
