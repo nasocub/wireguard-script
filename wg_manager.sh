@@ -2,8 +2,9 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.3
+# 版本: 1.4
 # 更新日志:
+# v1.4: 新增设置出站协议优先级(IPv4/IPv6)的功能。
 # v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能，解决 "IPv6 is disabled" 错误。
 # v1.2: 修复了在OpenVZ/LXC等容器化环境中因权限不足导致IP地址分配失败的问题。
 # v1.1: 修复了在部分系统中因缺少 `resolvconf` 依赖而启动失败的问题。
@@ -95,7 +96,6 @@ check_dependencies() {
     fi
 }
 
-# [v1.3 新增] 启用系统级IPv6支持
 enable_ipv6() {
     if [ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
         if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" -eq 1 ]; then
@@ -147,7 +147,7 @@ install_wg() {
     info "正在生成 WireGuard 配置文件..."
     manual_input_config
 
-    # [v1.3] 如果配置中包含IPv6地址，则确保系统启用IPv6
+    # 如果配置中包含IPv6地址，则确保系统启用IPv6
     if [[ "$WG_ADDRESS" == *":"* ]] || [[ "$PEER_ALLOWED_IPS" == *":"* ]]; then
         enable_ipv6
     fi
@@ -245,6 +245,40 @@ on_off() {
     fi
 }
 
+# [v1.4 新增] 设置出站优先级
+set_priority() {
+    hint "\n--- 设置出站网络优先级 ---"
+    echo "当前系统在访问双栈(IPv4/IPv6)网站时，会优先使用哪个协议？"
+    hint "1. 优先使用 IPv4 (默认)"
+    hint "2. 优先使用 IPv6"
+    hint "0. 返回主菜单"
+    reading "请输入选项 [0-2]: " priority_choice
+
+    # 先清除旧的配置
+    if [ -f /etc/gai.conf ]; then
+        sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
+        sed -i '/^label 2002::\/16/d' /etc/gai.conf
+    fi
+
+    case "$priority_choice" in
+        1)
+            echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+            info "已设置优先使用 IPv4 出站。"
+            ;;
+        2)
+            echo "label 2002::/16   2" >> /etc/gai.conf
+            info "已设置优先使用 IPv6 出站。"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            warning "无效输入。"
+            ;;
+    esac
+    sleep 2
+}
+
 uninstall_wg() {
     local prompt=${1:-"prompt"} # 接收一个可选参数来跳过确认提示
     
@@ -307,23 +341,25 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.3"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.4"
     echo "=============================================="
     hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
     hint "3. 查看 WireGuard 状态和网络"
-    hint "4. 彻底卸载 WireGuard 接口"
+    hint "4. 设置出站优先级 (IPv4/IPv6)"
+    hint "5. 彻底卸载 WireGuard 接口"
     hint "0. 退出脚本"
     echo "----------------------------------------------"
-    reading "请输入选项 [0-4]: " choice
+    reading "请输入选项 [0-5]: " choice
 
     case "$choice" in
         1) install_wg ;;
         2) on_off ;;
         3) show_status ;;
-        4) uninstall_wg ;;
+        4) set_priority ;;
+        5) uninstall_wg ;;
         0) exit 0 ;;
-        *) warning "无效输入，请输入 0-4 之间的数字。" && sleep 2 ;;
+        *) warning "无效输入，请输入 0-5 之间的数字。" && sleep 2 ;;
     esac
 }
 
