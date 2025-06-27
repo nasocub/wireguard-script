@@ -2,7 +2,10 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.0
+# 版本: 1.1
+# 更新日志:
+# v1.1: 修复了在部分系统中因缺少 `resolvconf` 依赖而启动失败的问题。
+#
 # 功能: 手动配置WireGuard接口，并智能配置策略路由，
 #      实现仅出站流量走WireGuard，不影响入站服务。
 #
@@ -51,11 +54,23 @@ check_dependencies() {
     hint "正在检查并安装必要的依赖..."
     DEPS_CHECK=("ping" "wget" "curl" "ip")
     DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2")
+    
+    # [v1.1 新增] 为Debian/Ubuntu系统添加resolvconf依赖检查
+    if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
+        DEPS_CHECK+=("resolvconf")
+        DEPS_INSTALL+=("resolvconf")
+    fi
+    
     DEPS_TO_INSTALL=()
 
     for i in "${!DEPS_CHECK[@]}"; do
-        [ ! -x "$(type -p ${DEPS_CHECK[i]})" ] && DEPS_TO_INSTALL+=(${DEPS_INSTALL[i]})
+        if ! type -p "${DEPS_CHECK[i]}" > /dev/null; then
+             DEPS_TO_INSTALL+=(${DEPS_INSTALL[i]})
+        fi
     done
+
+    # 移除可能存在的重复项
+    DEPS_TO_INSTALL=($(printf "%s\n" "${DEPS_TO_INSTALL[@]}" | sort -u | tr '\n' ' '))
 
     if [ "${#DEPS_TO_INSTALL[@]}" -ge 1 ];
     then
@@ -67,18 +82,12 @@ check_dependencies() {
     fi
     
     # 检查并安装wireguard-tools
-    if [ ! -x "$(type -p wg-quick)" ]; then
+    if ! type -p wg-quick > /dev/null; then
         info "正在安装 wireguard-tools..."
-        case "$SYSTEM" in
-            "Debian"|"Ubuntu")
-                ${PACKAGE_INSTALL[int]} wireguard-tools openresolv
-                ;;
-            "CentOS"|"Fedora")
-                [ "$SYSTEM" = "CentOS" ] && ${PACKAGE_INSTALL[int]} epel-release
-                ${PACKAGE_INSTALL[int]} wireguard-tools
-                ;;
-        esac
-        [ ! -x "$(type -p wg-quick)" ] && error "错误：wireguard-tools 安装失败，请手动安装后重试。"
+        ${PACKAGE_INSTALL[int]} wireguard-tools >/dev/null 2>&1
+        if ! type -p wg-quick > /dev/null; then
+            error "错误：wireguard-tools 安装失败，请手动安装后重试。"
+        fi
     else
         info "wireguard-tools 已安装。"
     fi
@@ -109,12 +118,19 @@ manual_input_config() {
 
 # 3. 生成配置文件并设置路由
 install_wg() {
+    # 如果已存在配置，先执行卸载流程进行清理
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        warning "检测到已存在的 wg0.conf 配置文件。将先为您执行清理..."
+        uninstall_wg "no-prompt"
+        info "清理完成，现在开始新的安装。"
+    fi
+
     info "正在生成 WireGuard 配置文件..."
     manual_input_config
 
     # 获取服务器主网卡IP
-    LAN4=$(ip -4 route get 8.8.8.8 | awk '{print $7}' | head -n1)
-    LAN6=$(ip -6 route get 2001:4860:4860::8888 | awk '{print $10}' | head -n1)
+    LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
+    LAN6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1)
     
     mkdir -p /etc/wireguard
     
@@ -141,8 +157,8 @@ EOF
     fi
 
     # Docker 容器的流量也走主路由表，防止影响容器网络
-    POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main; "
-    POSTDOWN_RULES+="ip -4 rule del from 172.17.0.0/16 table main; "
+    POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main 2>/dev/null; "
+    POSTDOWN_RULES+="ip -4 rule del from 172.17.0.0/16 table main 2>/dev/null; "
 
     # 写入PostUp和PostDown
     echo "PostUp = ${POSTUP_RULES}" >> /etc/wireguard/wg0.conf
@@ -197,11 +213,15 @@ on_off() {
 }
 
 uninstall_wg() {
-    hint "你确定要卸载 WireGuard 接口并删除配置文件吗？"
-    reading "[y/N]: " confirm
-    if [[ "${confirm,,}" != "y" ]]; then
-        info "操作已取消。"
-        exit 0
+    local prompt=${1:-"prompt"} # 接收一个可选参数来跳过确认提示
+    
+    if [ "$prompt" = "prompt" ]; then
+        hint "你确定要卸载 WireGuard 接口并删除配置文件吗？"
+        reading "[y/N]: " confirm
+        if [[ "${confirm,,}" != "y" ]]; then
+            info "操作已取消。"
+            exit 0
+        fi
     fi
     
     info "正在停止并禁用服务..."
@@ -211,14 +231,15 @@ uninstall_wg() {
     info "正在删除配置文件..."
     rm -f /etc/wireguard/wg0.conf
     
-    # 询问是否卸载wireguard-tools
-    reading "是否要卸载 wireguard-tools 依赖包？[y/N]: " uninstall_deps
-    if [[ "${uninstall_deps,,}" == "y" ]]; then
-        info "正在卸载 wireguard-tools..."
-        ${PACKAGE_UNINSTALL[int]} wireguard-tools >/dev/null 2>&1
+    if [ "$prompt" = "prompt" ]; then
+        # 询问是否卸载wireguard-tools
+        reading "是否要卸载 wireguard-tools 依赖包？[y/N]: " uninstall_deps
+        if [[ "${uninstall_deps,,}" == "y" ]]; then
+            info "正在卸载 wireguard-tools..."
+            ${PACKAGE_UNINSTALL[int]} wireguard-tools >/dev/null 2>&1
+        fi
+        info "卸载完成。"
     fi
-
-    info "卸载完成。"
 }
 
 show_status() {
@@ -231,36 +252,34 @@ show_status() {
     wg show wg0
     
     hint "\n--- 网络连通性测试 ---"
-    IPV4_CHECK=$(curl -s -4 --connect-timeout 5 https://www.cloudflare.com/cdn-cgi/trace | grep 'warp=' | sed 's/warp=//')
-    IPV6_CHECK=$(curl -s -6 --connect-timeout 5 https://www.cloudflare.com/cdn-cgi/trace | grep 'warp=' | sed 's/warp=//')
+    # 使用ip.sb进行测试，因为它同时支持v4和v6
+    IPV4_IP=$(curl -s -4 --connect-timeout 5 https://api.ip.sb/ip)
+    IPV6_IP=$(curl -s -6 --connect-timeout 5 https://api.ip.sb/ip)
     
-    if [ -n "$IPV4_CHECK" ]; then
-        info "IPv4 出站: 正在通过 WireGuard ($IPV4_CHECK)"
-        info "IPv4 IP: $(curl -s -4 https://ip.sb)"
+    if [ -n "$IPV4_IP" ]; then
+        info "IPv4 出站 IP: $IPV4_IP"
     else
-        warning "IPv4 出站: 未通过 WireGuard"
+        warning "IPv4 出站: 无法访问"
     fi
     
-    if [ -n "$IPV6_CHECK" ]; then
-        info "IPv6 出站: 正在通过 WireGuard ($IPV6_CHECK)"
-        info "IPv6 IP: $(curl -s -6 https://ip.sb)"
+    if [ -n "$IPV6_IP" ]; then
+        info "IPv6 出站 IP: $IPV6_IP"
     else
-        warning "IPv6 出站: 未通过 WireGuard"
+        warning "IPv6 出站: 无法访问"
     fi
     echo ""
 }
-
 
 # --- 主菜单和执行逻辑 ---
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.1"
     echo "=============================================="
-    hint "1. 安装并配置一个新的 WireGuard 接口 (wg0)"
+    hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
     hint "3. 查看 WireGuard 状态和网络"
-    hint "4. 卸载 WireGuard 接口"
+    hint "4. 彻底卸载 WireGuard 接口"
     hint "0. 退出脚本"
     echo "----------------------------------------------"
     reading "请输入选项 [0-4]: " choice
