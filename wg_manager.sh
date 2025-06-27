@@ -2,8 +2,9 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.1
+# 版本: 1.2
 # 更新日志:
+# v1.2: 修复了在OpenVZ/LXC等容器化环境中因权限不足导致IP地址分配失败的问题。
 # v1.1: 修复了在部分系统中因缺少 `resolvconf` 依赖而启动失败的问题。
 #
 # 功能: 手动配置WireGuard接口，并智能配置策略路由，
@@ -55,7 +56,7 @@ check_dependencies() {
     DEPS_CHECK=("ping" "wget" "curl" "ip")
     DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2")
     
-    # [v1.1 新增] 为Debian/Ubuntu系统添加resolvconf依赖检查
+    # 为Debian/Ubuntu系统添加resolvconf依赖检查
     if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
         DEPS_CHECK+=("resolvconf")
         DEPS_INSTALL+=("resolvconf")
@@ -97,7 +98,7 @@ check_dependencies() {
 manual_input_config() {
     hint "\n--- 请输入您的 WireGuard [Interface] 配置 ---\n"
     reading "接口私钥 (PrivateKey): " WG_PRIVATE_KEY
-    reading "接口地址 (Address, e.g., 10.0.0.2/24,fd00::2/64): " WG_ADDRESS
+    reading "接口地址 (Address, 多个用逗号隔开 e.g., 10.0.0.2/24,fd00::2/64): " WG_ADDRESS
     reading "接口DNS (可选, 默认 1.1.1.1,8.8.8.8): " WG_DNS
     WG_DNS=${WG_DNS:-"1.1.1.1,8.8.8.8"}
 
@@ -135,17 +136,28 @@ install_wg() {
     mkdir -p /etc/wireguard
     
     # 写入基础配置
+    # [v1.2] 不再直接写入Address，将其移至PostUp
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
-Address = ${WG_ADDRESS}
 DNS = ${WG_DNS}
 EOF
 
     # 写入路由策略 (核心部分)
-    # 这部分确保只有服务器主动发出的流量走wg0，而外部访问服务器的流量不受影响
     POSTUP_RULES=""
     POSTDOWN_RULES=""
+    
+    # [v1.2] 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
+    # 将用户输入的地址（可能多个）分割并添加到PostUp/PostDown
+    IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
+    for addr in "${ADDRS[@]}"; do
+        # 去除可能存在的前后空格
+        addr=$(echo "$addr" | xargs)
+        if [ -n "$addr" ]; then
+            POSTUP_RULES+="ip address add $addr dev %i; "
+            POSTDOWN_RULES+="ip address del $addr dev %i; "
+        fi
+    done
 
     if [ -n "$LAN4" ]; then
         POSTUP_RULES+="ip -4 rule add from ${LAN4} table main; "
@@ -274,7 +286,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.1"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.2"
     echo "=============================================="
     hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
