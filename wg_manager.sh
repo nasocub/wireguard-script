@@ -2,12 +2,13 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.4
+# 版本: 1.5
 # 更新日志:
+# v1.5: 1.新增IPv6出口接管策略，允许WG的IPv6完全替代原生IPv6出口。2.增强接口清理机制，修复'wg0 already exists'错误。
 # v1.4: 新增设置出站协议优先级(IPv4/IPv6)的功能。
-# v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能，解决 "IPv6 is disabled" 错误。
-# v1.2: 修复了在OpenVZ/LXC等容器化环境中因权限不足导致IP地址分配失败的问题。
-# v1.1: 修复了在部分系统中因缺少 `resolvconf` 依赖而启动失败的问题。
+# v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能。
+# v1.2: 修复了在OpenVZ/LXC等容器化环境中IP地址分配失败的问题。
+# v1.1: 修复了因缺少`resolvconf`依赖而启动失败的问题。
 #
 # 功能: 手动配置WireGuard接口，并智能配置策略路由，
 #      实现仅出站流量走WireGuard，不影响入站服务。
@@ -135,6 +136,23 @@ manual_input_config() {
     [ -z "$PEER_ENDPOINT" ] && error "错误：Peer端点(Endpoint)不能为空。"
 }
 
+# [v1.5 新增] 设置IPv6接管策略
+set_ipv6_takeover_policy() {
+    WG_IPV6_TAKEOVER="n" # 默认为不接管
+    if [ -n "$LAN6" ]; then
+        hint "\n--- IPv6 出口策略 ---"
+        echo "检测到您的服务器拥有原生IPv6地址 ($LAN6)。"
+        hint "是否让 WireGuard 完全接管所有 IPv6 出站流量？"
+        echo " - 选择 'y'，所有IPv6流量将通过WireGuard出口。这会使用WireGuard的IPv6地址访问网络。"
+        echo " - 选择 'n'，脚本将保留原生IPv6地址作为出口。这适合需要从固定原生IP访问某些服务的场景。"
+        reading "让 WireGuard 接管原生 IPv6 出口吗？[y/N]: " takeover_choice
+        if [[ "${takeover_choice,,}" == "y" ]]; then
+            WG_IPV6_TAKEOVER="y"
+        fi
+    fi
+}
+
+
 # 3. 生成配置文件并设置路由
 install_wg() {
     # 如果已存在配置，先执行卸载流程进行清理
@@ -152,9 +170,10 @@ install_wg() {
         enable_ipv6
     fi
     
-    # 获取服务器主网卡IP
+    # 获取服务器IP并询问IPv6接管策略
     LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
     LAN6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1)
+    set_ipv6_takeover_policy
     
     mkdir -p /etc/wireguard
     
@@ -172,7 +191,6 @@ EOF
     # 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
     IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
     for addr in "${ADDRS[@]}"; do
-        # 去除可能存在的前后空格
         addr=$(echo "$addr" | xargs)
         if [ -n "$addr" ]; then
             POSTUP_RULES+="ip address add $addr dev %i; "
@@ -180,16 +198,24 @@ EOF
         fi
     done
 
+    # IPv4 策略路由，保留原生IPv4入口
     if [ -n "$LAN4" ]; then
         POSTUP_RULES+="ip -4 rule add from ${LAN4} table main; "
         POSTDOWN_RULES+="ip -4 rule del from ${LAN4} table main; "
     fi
+
+    # [v1.5] 根据用户选择决定IPv6策略
     if [ -n "$LAN6" ]; then
-        POSTUP_RULES+="ip -6 rule add from ${LAN6} table main; "
-        POSTDOWN_RULES+="ip -6 rule del from ${LAN6} table main; "
+        if [ "$WG_IPV6_TAKEOVER" != "y" ]; then
+            POSTUP_RULES+="ip -6 rule add from ${LAN6} table main; "
+            POSTDOWN_RULES+="ip -6 rule del from ${LAN6} table main; "
+            info "已配置保留原生 IPv6 出口。"
+        else
+            info "已配置 WireGuard IPv6 接管原生出口。"
+        fi
     fi
 
-    # Docker 容器的流量也走主路由表，防止影响容器网络
+    # Docker 容器的流量也走主路由表
     POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main 2>/dev/null; "
     POSTDOWN_RULES+="ip -4 rule del from 172.17.0.0/16 table main 2>/dev/null; "
 
@@ -215,9 +241,16 @@ EOF
 
     info "配置文件 /etc/wireguard/wg0.conf 已生成。"
     
-    # 启用并启动服务
+    # [v1.5] 增强启动流程以提高稳定性
+    info "正在停止任何可能存在的 wg0 接口以确保环境干净..."
+    systemctl stop wg-quick@wg0 >/dev/null 2>&1
+    # 强制删除可能卡住的接口
+    ip link delete wg0 2>/dev/null
+    sleep 1
+
     systemctl enable wg-quick@wg0 >/dev/null 2>&1
-    systemctl restart wg-quick@wg0
+    info "正在启动新的 wg0 接口..."
+    systemctl start wg-quick@wg0
 
     sleep 3
     if systemctl is-active --quiet wg-quick@wg0; then
@@ -245,7 +278,6 @@ on_off() {
     fi
 }
 
-# [v1.4 新增] 设置出站优先级
 set_priority() {
     hint "\n--- 设置出站网络优先级 ---"
     echo "当前系统在访问双栈(IPv4/IPv6)网站时，会优先使用哪个协议？"
@@ -341,7 +373,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.4"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.5"
     echo "=============================================="
     hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
