@@ -2,10 +2,11 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.5
+# 版本: 1.6
 #
 # 更新日志:
-# v1.5: 增强up脚本，使其能正确识别并处理由'redirect-gateway ipv6'推送的网关，修复IPv6接管失败的问题。
+# v1.6: 采用更可靠的方式检测并配置IPv6路由，彻底修复IPv6接管在某些配置下不生效的问题。
+# v1.5: 增强up脚本，使其能正确识别并处理由'redirect-gateway ipv6'推送的网关。(已废弃)
 # v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑。
 # v1.2: 自动注释掉不兼容的'block-outside-dns'指令。
 # v1.1: 新增直接粘贴.ovpn内容的功能。
@@ -200,17 +201,11 @@ install_ovpn() {
     
     cat > "$OVPN_UP_SCRIPT" << EOF
 #!/bin/bash
-export PATH=\${PATH}:/usr/sbin
+export PATH=\${PATH}:/usr/sbin:/bin:/usr/bin
 # 路由表号
 TABLE_ID=100
 # 获取OpenVPN推送的网关
 GW4=\${route_vpn_gateway}
-GW6=\${ifconfig_ipv6_remote}
-
-# [v1.5] 如果ifconfig_ipv6_remote为空，则尝试使用route_ipv6_gateway
-if [ -z "\$GW6" ]; then
-    GW6=\${route_ipv6_gateway}
-fi
 
 # IPv4策略路由
 if [ -n "\$GW4" ]; then
@@ -221,9 +216,12 @@ if [ -n "\$GW4" ]; then
     ip rule add not fwmark 0x2a table \$TABLE_ID priority 102
 fi
 
-# IPv6策略路由
-if [ -n "\$GW6" ]; then
-    ip -6 route add default via \$GW6 dev \$dev table \$TABLE_ID
+# [v1.6] 更可靠的IPv6路由处理
+# OpenVPN连接成功后，tun设备(\$dev)会被分配一个IPv6地址。我们检查这个地址是否存在。
+IPV6_ADDR=\$(ip -6 addr show dev \$dev scope global | awk '/inet6/{print \$2}')
+if [ -n "\$IPV6_ADDR" ]; then
+    # 对于点对点设备，无需指定网关
+    ip -6 route add default dev \$dev table \$TABLE_ID
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
         ip -6 rule add from $LAN6 table main priority 100
     fi
@@ -235,7 +233,7 @@ EOF
     # 创建down脚本
     cat > "$OVPN_DOWN_SCRIPT" << EOF
 #!/bin/bash
-export PATH=\${PATH}:/usr/sbin
+export PATH=\${PATH}:/usr/sbin:/bin:/usr/bin
 TABLE_ID=100
 # 清理IPv4规则
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
@@ -243,9 +241,7 @@ ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
 
 # 清理IPv6规则
-if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
-    ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
-fi
+ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 ip -6 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -6 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
 EOF
@@ -342,7 +338,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.5"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.6"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
