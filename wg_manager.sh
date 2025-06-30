@@ -2,7 +2,11 @@
 
 #
 # 通用 VPN 智能路由管理脚本 (合并版)
-# 版本: 2.0
+# 版本: 2.1
+#
+# 更新日志:
+# v2.1: 改进状态检查，使用 ifconfig.co 显示更详细的出站 IP 和服务商信息。
+# v2.0: 合并 WireGuard 和 OpenVPN 脚本，提供统一管理菜单。
 #
 # 功能:
 # 1. 统一管理 WireGuard 和 OpenVPN 客户端。
@@ -302,11 +306,15 @@ wg_show_status() {
     wg show wg0
     
     hint "\n--- 网络连通性测试 ---"
-    IPV4_IP=$(curl -s -4 --connect-timeout 5 https://api.ip.sb/ip)
-    IPV6_IP=$(curl -s -6 --connect-timeout 5 https://api.ip.sb/ip)
-    
-    [ -n "$IPV4_IP" ] && info "IPv4 出站 IP: $IPV4_IP" || warning "IPv4 出站: 无法访问"
-    [ -n "$IPV6_IP" ] && info "IPv6 出站 IP: $IPV6_IP" || warning "IPv6 出站: 无法访问"
+    info "IPv4 出站信息:"
+    if ! curl -4s --connect-timeout 10 ifconfig.co; then
+        warning "无法获取 IPv4 出站信息 (无连接或超时)。"
+    fi
+    echo "----------------------------------------------"
+    info "IPv6 出站信息:"
+    if ! curl -6s --connect-timeout 10 ifconfig.co; then
+        warning "无法获取 IPv6 出站信息 (无连接或超时)。"
+    fi
     echo ""
 }
 
@@ -524,11 +532,15 @@ open_show_status() {
     systemctl status "openvpn-client@${OVPN_CONFIG_NAME%.*}" | grep "Active:"
     
     hint "\n--- 网络连通性测试 ---"
-    IPV4_IP=$(curl -s -4 --connect-timeout 5 https://api.ip.sb/ip)
-    IPV6_IP=$(curl -s -6 --connect-timeout 5 https://api.ip.sb/ip)
-    
-    [ -n "$IPV4_IP" ] && info "IPv4 出站 IP: $IPV4_IP" || warning "IPv4 出站: 无法访问"
-    [ -n "$IPV6_IP" ] && info "IPv6 出站 IP: $IPV6_IP" || warning "IPv6 出站: 无法访问"
+    info "IPv4 出站信息:"
+    if ! curl -4s --connect-timeout 10 ifconfig.co; then
+        warning "无法获取 IPv4 出站信息 (无连接或超时)。"
+    fi
+    echo "----------------------------------------------"
+    info "IPv6 出站信息:"
+    if ! curl -6s --connect-timeout 10 ifconfig.co; then
+        warning "无法获取 IPv6 出站信息 (无连接或超时)。"
+    fi
     echo ""
 }
 
@@ -606,7 +618,7 @@ open_menu() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 VPN 智能路由管理脚本 v2.0"
+    echo "      通用 VPN 智能路由管理脚本 v2.1"
     echo "=============================================="
     info "当前活动服务:"
     if systemctl is-active --quiet wg-quick@wg0; then
