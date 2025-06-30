@@ -2,9 +2,10 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.5
+# 版本: 1.6
 # 更新日志:
-# v1.5: 1.新增IPv6出口接管策略，允许WG的IPv6完全替代原生IPv6出口。2.增强接口清理机制，修复'wg0 already exists'错误。
+# v1.6: 新增端口排除功能，允许指定端口的流量绕过WireGuard，使用原生IP出口。
+# v1.5: 1.新增IPv6出口接管策略。2.增强接口清理机制，修复'wg0 already exists'错误。
 # v1.4: 新增设置出站协议优先级(IPv4/IPv6)的功能。
 # v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能。
 # v1.2: 修复了在OpenVZ/LXC等容器化环境中IP地址分配失败的问题。
@@ -56,8 +57,9 @@ check_operating_system() {
 
 check_dependencies() {
     hint "正在检查并安装必要的依赖..."
-    DEPS_CHECK=("ping" "wget" "curl" "ip")
-    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2")
+    # [v1.6] 添加iptables依赖检查
+    DEPS_CHECK=("ping" "wget" "curl" "ip" "iptables")
+    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2" "iptables")
     
     # 为Debian/Ubuntu系统添加resolvconf依赖检查
     if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
@@ -129,6 +131,11 @@ manual_input_config() {
     PEER_ALLOWED_IPS=${PEER_ALLOWED_IPS:-"0.0.0.0/0,::/0"}
     reading "持久连接 (PersistentKeepalive, 可选, 建议 25): " PEER_KEEPALIVE
 
+    # [v1.6] 新增询问排除端口
+    hint "\n--- [可选] 端口排除策略 ---"
+    echo "您可以指定某些端口的流量不经过WireGuard，而是使用服务器原生IP出口。"
+    reading "请输入要排除的端口 (多个用逗号隔开, e.g., 80,443,8080, 直接回车则不设置): " EXCLUDE_PORTS
+
     # 验证输入
     [ -z "$WG_PRIVATE_KEY" ] && error "错误：接口私钥(PrivateKey)不能为空。"
     [ -z "$WG_ADDRESS" ] && error "错误：接口地址(Address)不能为空。"
@@ -136,7 +143,6 @@ manual_input_config() {
     [ -z "$PEER_ENDPOINT" ] && error "错误：Peer端点(Endpoint)不能为空。"
 }
 
-# [v1.5 新增] 设置IPv6接管策略
 set_ipv6_takeover_policy() {
     WG_IPV6_TAKEOVER="n" # 默认为不接管
     if [ -n "$LAN6" ]; then
@@ -188,6 +194,32 @@ EOF
     POSTUP_RULES=""
     POSTDOWN_RULES=""
     
+    # [v1.6] 为端口排除功能定义防火墙标记
+    EXCLUDE_MARK="1337"
+
+    # [v1.6] 添加端口排除的路由规则和iptables规则
+    if [ -n "$EXCLUDE_PORTS" ]; then
+        info "正在为排除的端口配置路由规则..."
+        POSTUP_RULES+="ip rule add fwmark $EXCLUDE_MARK table main priority 99; "
+        POSTDOWN_RULES+="ip rule del priority 99; "
+        
+        IFS=',' read -ra PORTS <<< "$EXCLUDE_PORTS"
+        for port in "${PORTS[@]}"; do
+            port=$(echo "$port" | xargs)
+            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] && [ "$port" -le 65535 ]; then
+                POSTUP_RULES+="iptables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
+                POSTUP_RULES+="iptables -t mangle -A OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
+                POSTUP_RULES+="ip6tables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
+                POSTUP_RULES+="ip6tables -t mangle -A OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
+
+                POSTDOWN_RULES+="iptables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
+                POSTDOWN_RULES+="iptables -t mangle -D OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
+                POSTDOWN_RULES+="ip6tables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
+                POSTDOWN_RULES+="ip6tables -t mangle -D OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
+            fi
+        done
+    fi
+
     # 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
     IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
     for addr in "${ADDRS[@]}"; do
@@ -200,15 +232,15 @@ EOF
 
     # IPv4 策略路由，保留原生IPv4入口
     if [ -n "$LAN4" ]; then
-        POSTUP_RULES+="ip -4 rule add from ${LAN4} table main; "
-        POSTDOWN_RULES+="ip -4 rule del from ${LAN4} table main; "
+        POSTUP_RULES+="ip -4 rule add from ${LAN4} table main priority 100; "
+        POSTDOWN_RULES+="ip -4 rule del priority 100; "
     fi
 
-    # [v1.5] 根据用户选择决定IPv6策略
+    # 根据用户选择决定IPv6策略
     if [ -n "$LAN6" ]; then
         if [ "$WG_IPV6_TAKEOVER" != "y" ]; then
-            POSTUP_RULES+="ip -6 rule add from ${LAN6} table main; "
-            POSTDOWN_RULES+="ip -6 rule del from ${LAN6} table main; "
+            POSTUP_RULES+="ip -6 rule add from ${LAN6} table main priority 101; "
+            POSTDOWN_RULES+="ip -6 rule del priority 101; "
             info "已配置保留原生 IPv6 出口。"
         else
             info "已配置 WireGuard IPv6 接管原生出口。"
@@ -216,8 +248,8 @@ EOF
     fi
 
     # Docker 容器的流量也走主路由表
-    POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main 2>/dev/null; "
-    POSTDOWN_RULES+="ip -4 rule del from 172.17.0.0/16 table main 2>/dev/null; "
+    POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main priority 102 2>/dev/null; "
+    POSTDOWN_RULES+="ip -4 rule del priority 102 2>/dev/null; "
 
     # 写入PostUp和PostDown
     echo "PostUp = ${POSTUP_RULES}" >> /etc/wireguard/wg0.conf
@@ -241,7 +273,7 @@ EOF
 
     info "配置文件 /etc/wireguard/wg0.conf 已生成。"
     
-    # [v1.5] 增强启动流程以提高稳定性
+    # 增强启动流程以提高稳定性
     info "正在停止任何可能存在的 wg0 接口以确保环境干净..."
     systemctl stop wg-quick@wg0 >/dev/null 2>&1
     # 强制删除可能卡住的接口
@@ -373,7 +405,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.5"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.6"
     echo "=============================================="
     hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
