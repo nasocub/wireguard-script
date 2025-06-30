@@ -2,11 +2,11 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.6
+# 版本: 1.7
 #
 # 更新日志:
-# v1.6: 采用更可靠的方式检测并配置IPv6路由，彻底修复IPv6接管在某些配置下不生效的问题。
-# v1.5: 增强up脚本，使其能正确识别并处理由'redirect-gateway ipv6'推送的网关。(已废弃)
+# v1.7: 在up脚本中增加延迟，彻底解决因内核IP分配慢导致的IPv6路由配置失败问题。并增加调试日志。
+# v1.6: 采用更可靠的方式检测并配置IPv6路由。(已废弃)
 # v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑。
 # v1.2: 自动注释掉不兼容的'block-outside-dns'指令。
 # v1.1: 新增直接粘贴.ovpn内容的功能。
@@ -26,6 +26,7 @@ OVPN_CONFIG_NAME="client.conf"
 OVPN_AUTH_FILE="/etc/openvpn/auth.txt"
 OVPN_UP_SCRIPT="/etc/openvpn/up.sh"
 OVPN_DOWN_SCRIPT="/etc/openvpn/down.sh"
+OVPN_LOG_FILE="/tmp/ovpn-up-debug.log"
 
 # 字体颜色
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; } # 红色
@@ -202,6 +203,14 @@ install_ovpn() {
     cat > "$OVPN_UP_SCRIPT" << EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin:/bin:/usr/bin
+
+# [v1.7] 增加延迟以等待内核完成IP分配
+sleep 2
+
+# [v1.7] 增加调试日志
+LOG_FILE="$OVPN_LOG_FILE"
+echo "--- Running OVPN up script at \$(date) for device \$dev ---" > \$LOG_FILE
+
 # 路由表号
 TABLE_ID=100
 # 获取OpenVPN推送的网关
@@ -209,24 +218,32 @@ GW4=\${route_vpn_gateway}
 
 # IPv4策略路由
 if [ -n "\$GW4" ]; then
+    echo "IPv4 Gateway: \$GW4" >> \$LOG_FILE
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
     ip rule add from $LAN4 table main priority 100
     # 确保SSH连接始终走原生网络以防失联
     ip rule add ipproto tcp dport 22 table main priority 101
     ip rule add not fwmark 0x2a table \$TABLE_ID priority 102
+else
+    echo "IPv4 Gateway not found." >> \$LOG_FILE
 fi
 
-# [v1.6] 更可靠的IPv6路由处理
-# OpenVPN连接成功后，tun设备(\$dev)会被分配一个IPv6地址。我们检查这个地址是否存在。
+# [v1.7] 更可靠的IPv6路由处理
 IPV6_ADDR=\$(ip -6 addr show dev \$dev scope global | awk '/inet6/{print \$2}')
+echo "Detected IPv6 Addr on \$dev: \$IPV6_ADDR" >> \$LOG_FILE
+
 if [ -n "\$IPV6_ADDR" ]; then
+    echo "Configuring IPv6 routes..." >> \$LOG_FILE
     # 对于点对点设备，无需指定网关
     ip -6 route add default dev \$dev table \$TABLE_ID
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
+        echo "Preserving native IPv6 route for $LAN6" >> \$LOG_FILE
         ip -6 rule add from $LAN6 table main priority 100
     fi
     ip -6 rule add ipproto tcp dport 22 table main priority 101
     ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
+else
+    echo "No IPv6 address found on \$dev. Skipping IPv6 route configuration." >> \$LOG_FILE
 fi
 EOF
 
@@ -338,7 +355,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1."
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.7"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
