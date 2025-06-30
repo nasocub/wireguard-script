@@ -2,9 +2,10 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.7
+# 版本: 1.8
 #
 # 更新日志:
+# v1.8: 修复了up脚本中因使用无效fwmark导致的策略路由不生效问题。
 # v1.7: 在up脚本中增加延迟，彻底解决因内核IP分配慢导致的IPv6路由配置失败问题。并增加调试日志。
 # v1.6: 采用更可靠的方式检测并配置IPv6路由。(已废弃)
 # v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑。
@@ -220,10 +221,11 @@ GW4=\${route_vpn_gateway}
 if [ -n "\$GW4" ]; then
     echo "IPv4 Gateway: \$GW4" >> \$LOG_FILE
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
+    # 确保来自服务器主IP的流量和SSH连接始终走原生网络以防失联
     ip rule add from $LAN4 table main priority 100
-    # 确保SSH连接始终走原生网络以防失联
     ip rule add ipproto tcp dport 22 table main priority 101
-    ip rule add not fwmark 0x2a table \$TABLE_ID priority 102
+    # [v1.8] 修复：使用通用规则将其他所有流量导向VPN路由表
+    ip rule add table \$TABLE_ID priority 102
 else
     echo "IPv4 Gateway not found." >> \$LOG_FILE
 fi
@@ -241,7 +243,8 @@ if [ -n "\$IPV6_ADDR" ]; then
         ip -6 rule add from $LAN6 table main priority 100
     fi
     ip -6 rule add ipproto tcp dport 22 table main priority 101
-    ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
+    # [v1.8] 修复：使用通用规则将其他所有流量导向VPN路由表
+    ip -6 rule add table \$TABLE_ID priority 102
 else
     echo "No IPv6 address found on \$dev. Skipping IPv6 route configuration." >> \$LOG_FILE
 fi
@@ -255,12 +258,14 @@ TABLE_ID=100
 # 清理IPv4规则
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
-ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+# [v1.8] 修复：移除正确的通用规则
+ip -4 rule del table \$TABLE_ID priority 102 2>/dev/null
 
 # 清理IPv6规则
 ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 ip -6 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
-ip -6 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+# [v1.8] 修复：移除正确的通用规则
+ip -6 rule del table \$TABLE_ID priority 102 2>/dev/null
 EOF
 
     chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
@@ -355,7 +360,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.7"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.8"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
