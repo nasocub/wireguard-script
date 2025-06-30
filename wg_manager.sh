@@ -2,9 +2,10 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.2
+# 版本: 1.3
 #
 # 更新日志:
+# v1.3: 改进认证处理。当提示输入用户名/密码时，若用户留空，则不创建认证文件直接尝试启动。
 # v1.2: 自动注释掉.ovpn文件中不兼容的'block-outside-dns'指令，修复启动失败问题。
 # v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
 #
@@ -178,15 +179,25 @@ install_ovpn() {
 
     # 处理用户认证
     if grep -q "auth-user-pass" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-        # 仅当没有指定文件时才提示输入
+        # 仅当没有指定认证文件时才提示输入
         if ! grep -q "auth-user-pass .*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-            hint "检测到您的配置需要用户名和密码认证。"
-            reading "请输入用户名: " ovpn_user
-            reading "请输入密码: " ovpn_pass
-            echo "$ovpn_user" > "$OVPN_AUTH_FILE"
-            echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
-            chmod 600 "$OVPN_AUTH_FILE"
-            sed -i "s|^\s*auth-user-pass\s*$|auth-user-pass $OVPN_AUTH_FILE|" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+            hint "\n检测到您的配置可能需要用户名和密码认证。"
+            hint "如果您的 .ovpn 文件内已包含认证信息 (如 cert/key)，请将此处留空。"
+            reading "请输入用户名 (留空则跳过): " ovpn_user
+            read -sp "$(info "请输入密码 (密码隐藏，留空则跳过): ")" ovpn_pass
+            echo
+
+            # 只有当用户输入了用户名或密码时才创建认证文件
+            if [[ -n "$ovpn_user" || -n "$ovpn_pass" ]]; then
+                info "已收到认证信息，正在创建认证文件..."
+                echo "$ovpn_user" > "$OVPN_AUTH_FILE"
+                echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
+                chmod 600 "$OVPN_AUTH_FILE"
+                # 修改配置文件以使用认证文件
+                sed -i "s|^\s*auth-user-pass\s*$|auth-user-pass $OVPN_AUTH_FILE|" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+            else
+                info "未提供用户名和密码，脚本将不创建认证文件。OpenVPN将按原配置启动。"
+            fi
         fi
     fi
     
@@ -237,7 +248,7 @@ EOF
 
     chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
-    info "配置完成。正在启动OpenVPN..."
+    info "\n配置完成。正在启动OpenVPN..."
     systemctl enable "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
     systemctl restart "openvpn-client@${OVPN_CONFIG_NAME%.*}"
 
@@ -327,7 +338,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.2"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.3"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
