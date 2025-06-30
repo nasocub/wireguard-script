@@ -2,15 +2,12 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.8
+# 版本: 1.9
 #
 # 更新日志:
+# v1.9: 增加 systemctl daemon-reload 解决 'Unit not found' 问题，并添加文件诊断信息。
 # v1.8: 修复了up脚本中因使用无效fwmark导致的策略路由不生效问题。
 # v1.7: 在up脚本中增加延迟，彻底解决因内核IP分配慢导致的IPv6路由配置失败问题。并增加调试日志。
-# v1.6: 采用更可靠的方式检测并配置IPv6路由。(已废弃)
-# v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑。
-# v1.2: 自动注释掉不兼容的'block-outside-dns'指令。
-# v1.1: 新增直接粘贴.ovpn内容的功能。
 #
 # 功能:
 # 1. 支持通过文件路径或直接粘贴内容来使用标准的.ovpn配置文件。
@@ -168,10 +165,8 @@ install_ovpn() {
     set_ipv6_takeover_policy
 
     # 修改.ovpn配置文件以适应脚本
-    # 移除与策略路由冲突的指令
     sed -i '/^redirect-gateway/d' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     sed -i '/^dhcp-option DNS/d' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
-    # 注释掉不兼容的 block-outside-dns 指令
     sed -i 's/^\s*block-outside-dns/#&/' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     
     # 添加脚本钩子
@@ -181,20 +176,15 @@ install_ovpn() {
     echo "up $OVPN_UP_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     echo "down $OVPN_DOWN_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
 
-    # 修复并加固用户认证逻辑
-    # 检查文件中是否存在 'auth-user-pass' 指令，且该指令后面没有指定文件
     if grep -qE "^\s*auth-user-pass\s*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-        # 如果找到了需要交互式输入的 auth-user-pass 指令
         hint "检测到您的配置需要用户名和密码认证。"
         reading "请输入用户名: " ovpn_user
         reading "请输入密码: " ovpn_pass
         echo "$ovpn_user" > "$OVPN_AUTH_FILE"
         echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
         chmod 600 "$OVPN_AUTH_FILE"
-        # 修改配置文件，将'auth-user-pass'替换为'auth-user-pass /path/to/auth.txt'
         sed -i "s#^\s*auth-user-pass\s*#auth-user-pass $OVPN_AUTH_FILE#" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     elif grep -qE "^\s*auth-user-pass\s+[^\s].*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-        # 如果指令后面已经跟了文件名
         info "检测到 auth-user-pass 已指定文件，将直接使用。"
     fi
     
@@ -204,46 +194,30 @@ install_ovpn() {
     cat > "$OVPN_UP_SCRIPT" << EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin:/bin:/usr/bin
-
-# [v1.7] 增加延迟以等待内核完成IP分配
 sleep 2
-
-# [v1.7] 增加调试日志
 LOG_FILE="$OVPN_LOG_FILE"
 echo "--- Running OVPN up script at \$(date) for device \$dev ---" > \$LOG_FILE
-
-# 路由表号
 TABLE_ID=100
-# 获取OpenVPN推送的网关
 GW4=\${route_vpn_gateway}
-
-# IPv4策略路由
 if [ -n "\$GW4" ]; then
     echo "IPv4 Gateway: \$GW4" >> \$LOG_FILE
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
-    # 确保来自服务器主IP的流量和SSH连接始终走原生网络以防失联
     ip rule add from $LAN4 table main priority 100
     ip rule add ipproto tcp dport 22 table main priority 101
-    # [v1.8] 修复：使用通用规则将其他所有流量导向VPN路由表
     ip rule add table \$TABLE_ID priority 102
 else
     echo "IPv4 Gateway not found." >> \$LOG_FILE
 fi
-
-# [v1.7] 更可靠的IPv6路由处理
 IPV6_ADDR=\$(ip -6 addr show dev \$dev scope global | awk '/inet6/{print \$2}')
 echo "Detected IPv6 Addr on \$dev: \$IPV6_ADDR" >> \$LOG_FILE
-
 if [ -n "\$IPV6_ADDR" ]; then
     echo "Configuring IPv6 routes..." >> \$LOG_FILE
-    # 对于点对点设备，无需指定网关
     ip -6 route add default dev \$dev table \$TABLE_ID
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
         echo "Preserving native IPv6 route for $LAN6" >> \$LOG_FILE
         ip -6 rule add from $LAN6 table main priority 100
     fi
     ip -6 rule add ipproto tcp dport 22 table main priority 101
-    # [v1.8] 修复：使用通用规则将其他所有流量导向VPN路由表
     ip -6 rule add table \$TABLE_ID priority 102
 else
     echo "No IPv6 address found on \$dev. Skipping IPv6 route configuration." >> \$LOG_FILE
@@ -255,22 +229,26 @@ EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin:/bin:/usr/bin
 TABLE_ID=100
-# 清理IPv4规则
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
-# [v1.8] 修复：移除正确的通用规则
 ip -4 rule del table \$TABLE_ID priority 102 2>/dev/null
-
-# 清理IPv6规则
 ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 ip -6 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
-# [v1.8] 修复：移除正确的通用规则
 ip -6 rule del table \$TABLE_ID priority 102 2>/dev/null
 EOF
 
     chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
+
+    # --- [v1.9] 新增诊断和daemon-reload ---
+    info "--- 诊断: 检查已创建的文件 ---"
+    ls -l "$OVPN_CONFIG_DIR/"
+    ls -l "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
-    info "配置完成。正在启动OpenVPN..."
+    info "正在重新加载 systemd daemon..."
+    systemctl daemon-reload
+    # --- 结束新增部分 ---
+    
+    info "配置完成。正在启用并启动OpenVPN..."
     systemctl enable "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
     systemctl restart "openvpn-client@${OVPN_CONFIG_NAME%.*}"
 
@@ -285,18 +263,14 @@ EOF
 
 # 3. 其他管理功能
 on_off() {
-    if [ ! -f "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}" ]; then
-        error "错误：找不到OpenVPN配置文件，请先安装。"
-    fi
-    
-    if systemctl is-active --quiet "openvpn-client@${OVPN_CONFIG_NAME%.*}"; then
-        hint "正在关闭 OpenVPN 客户端..."
-        systemctl stop "openvpn-client@${OVPN_CONFIG_NAME%.*}"
-        info "客户端已关闭。"
-    else
+    if ! systemctl is-active --quiet "openvpn-client@${OVPN_CONFIG_NAME%.*}"; then
         hint "正在启动 OpenVPN 客户端..."
         systemctl start "openvpn-client@${OVPN_CONFIG_NAME%.*}"
         info "客户端已启动。"
+    else
+        hint "正在关闭 OpenVPN 客户端..."
+        systemctl stop "openvpn-client@${OVPN_CONFIG_NAME%.*}"
+        info "客户端已关闭。"
     fi
 }
 
@@ -319,6 +293,10 @@ uninstall_ovpn() {
     info "正在删除配置文件和脚本..."
     rm -rf "$OVPN_CONFIG_DIR" "$OVPN_AUTH_FILE" "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
+    # [v1.9] 确保在卸载后也重载daemon
+    info "正在重新加载 systemd daemon..."
+    systemctl daemon-reload
+    
     if [ "$prompt" = "prompt" ]; then
         reading "是否要卸载 openvpn 软件包？[y/N]: " uninstall_deps
         if [[ "${uninstall_deps,,}" == "y" ]]; then
@@ -330,13 +308,21 @@ uninstall_ovpn() {
 }
 
 show_status() {
-    if ! systemctl is-active --quiet "openvpn-client@${OVPN_CONFIG_NAME%.*}"; then
+    SERVICE_NAME="openvpn-client@${OVPN_CONFIG_NAME%.*}"
+    if ! systemctl list-units --full -all | grep -q "$SERVICE_NAME"; then
+         warning "错误：OpenVPN 服务 ($SERVICE_NAME) 未安装或配置文件已丢失。"
+         return
+    fi
+    
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
         warning "OpenVPN 客户端当前未运行。"
+        hint "最近的日志:"
+        journalctl -u $SERVICE_NAME -n 5 --no-pager
         return
     fi
     
     info "\n--- OpenVPN 状态 ---"
-    systemctl status "openvpn-client@${OVPN_CONFIG_NAME%.*}" | grep "Active:"
+    systemctl status "$SERVICE_NAME" | grep "Active:"
     
     hint "\n--- 网络连通性测试 ---"
     IPV4_IP=$(curl -s -4 --connect-timeout 5 https://api.ip.sb/ip)
@@ -360,7 +346,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.8"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.9"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
