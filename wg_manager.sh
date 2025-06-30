@@ -2,10 +2,11 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.3
+# 版本: 1.4
 #
 # 更新日志:
-# v1.3: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑，确保能正确提示输入并启动。
+# v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑，确保能正确提示输入并启动。
+# v1.3: [已废弃]
 # v1.2: 自动注释掉.ovpn文件中不兼容的'block-outside-dns'指令，修复启动失败问题。
 # v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
 #
@@ -177,22 +178,21 @@ install_ovpn() {
     echo "up $OVPN_UP_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     echo "down $OVPN_DOWN_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
 
-    # [v1.3] 修复并加固用户认证逻辑
-    if grep -q "auth-user-pass" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-        # 检查 auth-user-pass 后面是否已经跟了文件路径 (一个或多个非空格字符)
-        if ! grep -qE "^\s*auth-user-pass\s+[^\s].*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-            # 如果没有，则提示用户输入
-            hint "检测到您的配置需要用户名和密码认证。"
-            reading "请输入用户名: " ovpn_user
-            reading "请输入密码: " ovpn_pass
-            echo "$ovpn_user" > "$OVPN_AUTH_FILE"
-            echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
-            chmod 600 "$OVPN_AUTH_FILE"
-            # 修改配置文件，指向我们创建的认证文件
-            sed -i "s|^\s*auth-user-pass\s*|auth-user-pass $OVPN_AUTH_FILE|" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
-        else
-            info "检测到 auth-user-pass 已指定文件，将直接使用。"
-        fi
+    # [v1.4] 修复并加固用户认证逻辑
+    # 检查文件中是否存在 'auth-user-pass' 指令，且该指令后面没有指定文件
+    if grep -qE "^\s*auth-user-pass\s*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+        # 如果找到了需要交互式输入的 auth-user-pass 指令
+        hint "检测到您的配置需要用户名和密码认证。"
+        reading "请输入用户名: " ovpn_user
+        reading "请输入密码: " ovpn_pass
+        echo "$ovpn_user" > "$OVPN_AUTH_FILE"
+        echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
+        chmod 600 "$OVPN_AUTH_FILE"
+        # 修改配置文件，将'auth-user-pass'替换为'auth-user-pass /path/to/auth.txt'
+        sed -i "s#^\s*auth-user-pass\s*#auth-user-pass $OVPN_AUTH_FILE#" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    elif grep -qE "^\s*auth-user-pass\s+[^\s].*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+        # 如果指令后面已经跟了文件名
+        info "检测到 auth-user-pass 已指定文件，将直接使用。"
     fi
     
     # 创建up脚本
@@ -332,7 +332,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1."
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.4"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
