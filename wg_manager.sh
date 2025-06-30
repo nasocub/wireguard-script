@@ -2,9 +2,10 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.3
+# 版本: 1.4
 #
 # 更新日志:
+# v1.4: 修复策略路由问题。添加新规则确保从服务器本地发起的流量（如curl）正确通过VPN，同时保持入站连接的回复流量使用原生网关。
 # v1.3: 改进认证处理。当提示输入用户名/密码时，若用户留空，则不创建认证文件直接尝试启动。
 # v1.2: 自动注释掉.ovpn文件中不兼容的'block-outside-dns'指令，修复启动失败问题。
 # v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
@@ -216,6 +217,9 @@ GW6=\${ifconfig_ipv6_remote}
 # IPv4策略路由
 if [ -n "\$GW4" ]; then
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
+    # [v1.4] 新增规则: 匹配从本地发出的流量(如curl)，使其走VPN路由表
+    ip rule add iif lo table \$TABLE_ID priority 99
+    # 保留规则: 匹配回复流量(源IP是本机IP)，使其走主路由表，保证入站连接正常
     ip rule add from $LAN4 table main priority 100
     # 确保SSH连接始终走原生网络以防失联
     ip rule add ipproto tcp dport 22 table main priority 101
@@ -225,7 +229,10 @@ fi
 # IPv6策略路由
 if [ -n "\$GW6" ]; then
     ip -6 route add default via \$GW6 dev \$dev table \$TABLE_ID
+    # [v1.4] 新增规则: 匹配从本地发出的流量(如curl)，使其走VPN路由表
+    ip -6 rule add iif lo table \$TABLE_ID priority 99
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
+        # 保留规则: 匹配回复流量(源IP是本机IP)，使其走主路由表，保证入站连接正常
         ip -6 rule add from $LAN6 table main priority 100
     fi
     ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
@@ -237,9 +244,13 @@ EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin
 TABLE_ID=100
+# [v1.4] 清理iif lo规则
+ip -4 rule del iif lo table \$TABLE_ID priority 99 2>/dev/null
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+# [v1.4] 清理iif lo规则
+ip -6 rule del iif lo table \$TABLE_ID priority 99 2>/dev/null
 if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
     ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 fi
@@ -338,7 +349,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.3"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.4"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
