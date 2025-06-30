@@ -2,13 +2,13 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.4
+# 版本: 1.5
 #
 # 更新日志:
-# v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑，确保能正确提示输入并启动。
-# v1.3: [已废弃]
-# v1.2: 自动注释掉.ovpn文件中不兼容的'block-outside-dns'指令，修复启动失败问题。
-# v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
+# v1.5: 增强up脚本，使其能正确识别并处理由'redirect-gateway ipv6'推送的网关，修复IPv6接管失败的问题。
+# v1.4: 修复了对需要用户名/密码认证的.ovpn文件的处理逻辑。
+# v1.2: 自动注释掉不兼容的'block-outside-dns'指令。
+# v1.1: 新增直接粘贴.ovpn内容的功能。
 #
 # 功能:
 # 1. 支持通过文件路径或直接粘贴内容来使用标准的.ovpn配置文件。
@@ -158,7 +158,7 @@ install_ovpn() {
     esac
 
     # 检查是否需要IPv6支持
-    if grep -qE "tun-ipv6|proto (udp6|tcp6)" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+    if grep -qE "tun-ipv6|proto (udp6|tcp6)|redirect-gateway ipv6" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
         enable_ipv6
     fi
     
@@ -178,7 +178,7 @@ install_ovpn() {
     echo "up $OVPN_UP_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     echo "down $OVPN_DOWN_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
 
-    # [v1.4] 修复并加固用户认证逻辑
+    # 修复并加固用户认证逻辑
     # 检查文件中是否存在 'auth-user-pass' 指令，且该指令后面没有指定文件
     if grep -qE "^\s*auth-user-pass\s*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
         # 如果找到了需要交互式输入的 auth-user-pass 指令
@@ -207,6 +207,11 @@ TABLE_ID=100
 GW4=\${route_vpn_gateway}
 GW6=\${ifconfig_ipv6_remote}
 
+# [v1.5] 如果ifconfig_ipv6_remote为空，则尝试使用route_ipv6_gateway
+if [ -z "\$GW6" ]; then
+    GW6=\${route_ipv6_gateway}
+fi
+
 # IPv4策略路由
 if [ -n "\$GW4" ]; then
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
@@ -222,6 +227,7 @@ if [ -n "\$GW6" ]; then
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
         ip -6 rule add from $LAN6 table main priority 100
     fi
+    ip -6 rule add ipproto tcp dport 22 table main priority 101
     ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
 fi
 EOF
@@ -231,12 +237,16 @@ EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin
 TABLE_ID=100
+# 清理IPv4规则
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+
+# 清理IPv6规则
 if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
     ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 fi
+ip -6 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -6 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
 EOF
 
@@ -332,7 +342,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.4"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.5"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
