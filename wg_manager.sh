@@ -2,10 +2,11 @@
 
 #
 # 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.6
+# 版本: 1.7
 # 更新日志:
+# v1.7: 采用独立的PostUp/PostDown脚本代替单行命令，彻底解决systemd解析和'wg0 already exists'问题。
 # v1.6: 新增端口排除功能，允许指定端口的流量绕过WireGuard，使用原生IP出口。
-# v1.5: 1.新增IPv6出口接管策略。2.增强接口清理机制，修复'wg0 already exists'错误。
+# v1.5: 1.新增IPv6出口接管策略。2.增强接口清理机制。
 # v1.4: 新增设置出站协议优先级(IPv4/IPv6)的功能。
 # v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能。
 # v1.2: 修复了在OpenVZ/LXC等容器化环境中IP地址分配失败的问题。
@@ -57,9 +58,9 @@ check_operating_system() {
 
 check_dependencies() {
     hint "正在检查并安装必要的依赖..."
-    # [v1.6] 添加iptables依赖检查
-    DEPS_CHECK=("ping" "wget" "curl" "ip" "iptables")
-    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2" "iptables")
+    # 添加iptables和ip6tables依赖检查
+    DEPS_CHECK=("ping" "wget" "curl" "ip" "iptables" "ip6tables")
+    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2" "iptables" "iptables")
     
     # 为Debian/Ubuntu系统添加resolvconf依赖检查
     if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
@@ -183,80 +184,95 @@ install_wg() {
     
     mkdir -p /etc/wireguard
     
-    # 写入基础配置
+    # [v1.7] 创建独立的PostUp脚本
+    cat > /etc/wireguard/wg0-up.sh << EOF
+#!/bin/bash
+# PostUp脚本，在wg0接口启动后执行
+
+# 为端口排除功能定义防火墙标记
+EXCLUDE_MARK="1337"
+
+# 添加端口排除的路由规则和iptables规则
+if [ -n "$EXCLUDE_PORTS" ]; then
+    ip rule add fwmark \$EXCLUDE_MARK table main priority 99
+    
+    IFS=',' read -ra PORTS <<< "$EXCLUDE_PORTS"
+    for port in "\${PORTS[@]}"; do
+        port=\$(echo "\$port" | xargs)
+        if [[ "\$port" =~ ^[0-9]+$ ]] && [ "\$port" -gt 0 ] && [ "\$port" -le 65535 ]; then
+            iptables -t mangle -A OUTPUT -p tcp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK
+            iptables -t mangle -A OUTPUT -p udp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK
+            ip6tables -t mangle -A OUTPUT -p tcp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK
+            ip6tables -t mangle -A OUTPUT -p udp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK
+        fi
+    done
+fi
+
+# 将IP地址分配移入PostUp
+IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
+for addr in "\${ADDRS[@]}"; do
+    addr=\$(echo "\$addr" | xargs)
+    if [ -n "\$addr" ]; then
+        ip address add \$addr dev %i
+    fi
+done
+
+# IPv4 策略路由，保留原生IPv4入口
+if [ -n "$LAN4" ]; then
+    ip -4 rule add from $LAN4 table main priority 100
+fi
+
+# 根据用户选择决定IPv6策略
+if [ -n "$LAN6" ]; then
+    if [ "$WG_IPV6_TAKEOVER" != "y" ]; then
+        ip -6 rule add from $LAN6 table main priority 101
+    fi
+fi
+
+# Docker 容器的流量也走主路由表
+ip -4 rule add from 172.17.0.0/16 table main priority 102 2>/dev/null
+EOF
+
+    # [v1.7] 创建独立的PostDown脚本
+    cat > /etc/wireguard/wg0-down.sh << EOF
+#!/bin/bash
+# PostDown脚本，在wg0接口关闭前执行
+
+# 为端口排除功能定义防火墙标记
+EXCLUDE_MARK="1337"
+
+# 清理端口排除的路由规则和iptables规则
+if [ -n "$EXCLUDE_PORTS" ]; then
+    ip rule del priority 99 2>/dev/null
+    
+    IFS=',' read -ra PORTS <<< "$EXCLUDE_PORTS"
+    for port in "\${PORTS[@]}"; do
+        port=\$(echo "\$port" | xargs)
+        if [[ "\$port" =~ ^[0-9]+$ ]] && [ "\$port" -gt 0 ] && [ "\$port" -le 65535 ]; then
+            iptables -t mangle -D OUTPUT -p tcp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK 2>/dev/null
+            iptables -t mangle -D OUTPUT -p udp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK 2>/dev/null
+            ip6tables -t mangle -D OUTPUT -p tcp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK 2>/dev/null
+            ip6tables -t mangle -D OUTPUT -p udp --dport \$port -j MARK --set-mark \$EXCLUDE_MARK 2>/dev/null
+        fi
+    done
+fi
+
+# 清理策略路由
+ip -4 rule del priority 100 2>/dev/null
+ip -6 rule del priority 101 2>/dev/null
+ip -4 rule del priority 102 2>/dev/null
+EOF
+    
+    # 赋予执行权限
+    chmod +x /etc/wireguard/wg0-up.sh /etc/wireguard/wg0-down.sh
+
+    # 写入主配置文件，现在非常简洁
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
 DNS = ${WG_DNS}
-EOF
-
-    # 写入路由策略 (核心部分)
-    POSTUP_RULES=""
-    POSTDOWN_RULES=""
-    
-    # [v1.6] 为端口排除功能定义防火墙标记
-    EXCLUDE_MARK="1337"
-
-    # [v1.6] 添加端口排除的路由规则和iptables规则
-    if [ -n "$EXCLUDE_PORTS" ]; then
-        info "正在为排除的端口配置路由规则..."
-        POSTUP_RULES+="ip rule add fwmark $EXCLUDE_MARK table main priority 99; "
-        POSTDOWN_RULES+="ip rule del priority 99; "
-        
-        IFS=',' read -ra PORTS <<< "$EXCLUDE_PORTS"
-        for port in "${PORTS[@]}"; do
-            port=$(echo "$port" | xargs)
-            if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -gt 0 ] && [ "$port" -le 65535 ]; then
-                POSTUP_RULES+="iptables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
-                POSTUP_RULES+="iptables -t mangle -A OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
-                POSTUP_RULES+="ip6tables -t mangle -A OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
-                POSTUP_RULES+="ip6tables -t mangle -A OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK; "
-
-                POSTDOWN_RULES+="iptables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
-                POSTDOWN_RULES+="iptables -t mangle -D OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
-                POSTDOWN_RULES+="ip6tables -t mangle -D OUTPUT -p tcp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
-                POSTDOWN_RULES+="ip6tables -t mangle -D OUTPUT -p udp --dport $port -j MARK --set-mark $EXCLUDE_MARK 2>/dev/null; "
-            fi
-        done
-    fi
-
-    # 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
-    IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
-    for addr in "${ADDRS[@]}"; do
-        addr=$(echo "$addr" | xargs)
-        if [ -n "$addr" ]; then
-            POSTUP_RULES+="ip address add $addr dev %i; "
-            POSTDOWN_RULES+="ip address del $addr dev %i; "
-        fi
-    done
-
-    # IPv4 策略路由，保留原生IPv4入口
-    if [ -n "$LAN4" ]; then
-        POSTUP_RULES+="ip -4 rule add from ${LAN4} table main priority 100; "
-        POSTDOWN_RULES+="ip -4 rule del priority 100; "
-    fi
-
-    # 根据用户选择决定IPv6策略
-    if [ -n "$LAN6" ]; then
-        if [ "$WG_IPV6_TAKEOVER" != "y" ]; then
-            POSTUP_RULES+="ip -6 rule add from ${LAN6} table main priority 101; "
-            POSTDOWN_RULES+="ip -6 rule del priority 101; "
-            info "已配置保留原生 IPv6 出口。"
-        else
-            info "已配置 WireGuard IPv6 接管原生出口。"
-        fi
-    fi
-
-    # Docker 容器的流量也走主路由表
-    POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main priority 102 2>/dev/null; "
-    POSTDOWN_RULES+="ip -4 rule del priority 102 2>/dev/null; "
-
-    # 写入PostUp和PostDown
-    echo "PostUp = ${POSTUP_RULES}" >> /etc/wireguard/wg0.conf
-    echo "PostDown = ${POSTDOWN_RULES}" >> /etc/wireguard/wg0.conf
-
-    # 写入Peer配置
-    cat >> /etc/wireguard/wg0.conf << EOF
+PostUp = bash /etc/wireguard/wg0-up.sh
+PostDown = bash /etc/wireguard/wg0-down.sh
 
 [Peer]
 PublicKey = ${PEER_PUBLIC_KEY}
@@ -271,7 +287,7 @@ EOF
         echo "PersistentKeepalive = ${PEER_KEEPALIVE}" >> /etc/wireguard/wg0.conf
     fi
 
-    info "配置文件 /etc/wireguard/wg0.conf 已生成。"
+    info "配置文件 /etc/wireguard/wg0.conf 及钩子脚本已生成。"
     
     # 增强启动流程以提高稳定性
     info "正在停止任何可能存在的 wg0 接口以确保环境干净..."
@@ -280,6 +296,8 @@ EOF
     ip link delete wg0 2>/dev/null
     sleep 1
 
+    # 重新加载systemd守护进程，以识别任何更改
+    systemctl daemon-reload
     systemctl enable wg-quick@wg0 >/dev/null 2>&1
     info "正在启动新的 wg0 接口..."
     systemctl start wg-quick@wg0
@@ -359,8 +377,8 @@ uninstall_wg() {
     systemctl stop wg-quick@wg0 >/dev/null 2>&1
     systemctl disable wg-quick@wg0 >/dev/null 2>&1
     
-    info "正在删除配置文件..."
-    rm -f /etc/wireguard/wg0.conf
+    info "正在删除配置文件和钩子脚本..."
+    rm -f /etc/wireguard/wg0.conf /etc/wireguard/wg0-up.sh /etc/wireguard/wg0-down.sh
     
     if [ "$prompt" = "prompt" ]; then
         # 询问是否卸载wireguard-tools
@@ -405,7 +423,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.6"
+    echo "      通用 WireGuard 智能路由管理脚本 v1.7"
     echo "=============================================="
     hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
     hint "2. 启动 / 关闭 WireGuard 接口"
