@@ -179,8 +179,8 @@ install_ovpn() {
 
     # [v1.3] 修复并加固用户认证逻辑
     if grep -q "auth-user-pass" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-        # 检查 auth-user-pass 后面是否已经跟了文件路径
-        if ! grep -qE "^\s*auth-user-pass\s+.*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+        # 检查 auth-user-pass 后面是否已经跟了文件路径 (一个或多个非空格字符)
+        if ! grep -qE "^\s*auth-user-pass\s+[^\s].*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
             # 如果没有，则提示用户输入
             hint "检测到您的配置需要用户名和密码认证。"
             reading "请输入用户名: " ovpn_user
@@ -332,7 +332,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.3"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1."
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
