@@ -2,9 +2,10 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.3
+# 版本: 1.4
 #
 # 更新日志:
+# v1.4: 新增功能：当OpenVPN连接不提供IPv6地址时，自动阻断所有IPv6出口流量，防止泄露原生IPv6地址。改进了up/down脚本，增加了日志记录和路由表清理。
 # v1.3: 改进认证处理。当提示输入用户名/密码时，若用户留空，则不创建认证文件直接尝试启动。
 # v1.2: 自动注释掉.ovpn文件中不兼容的'block-outside-dns'指令，修复启动失败问题。
 # v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
@@ -13,8 +14,9 @@
 # 1. 支持通过文件路径或直接粘贴内容来使用标准的.ovpn配置文件。
 # 2. 通过策略路由，仅将服务器出站流量通过OpenVPN发送，不影响入站服务。
 # 3. 支持在双栈服务器上，选择是否让OpenVPN完全接管IPv6出口。
-# 4. 自动处理需要用户名/密码认证的配置文件。
-# 5. 提供菜单式管理界面。
+# 4. 新增当VPN不提供IPv6时，自动阻断本机IPv6出口。
+# 5. 自动处理需要用户名/密码认证的配置文件。
+# 6. 提供菜单式管理界面。
 #
 
 # --- 全局变量和函数 ---
@@ -24,6 +26,7 @@ OVPN_CONFIG_NAME="client.conf"
 OVPN_AUTH_FILE="/etc/openvpn/auth.txt"
 OVPN_UP_SCRIPT="/etc/openvpn/up.sh"
 OVPN_DOWN_SCRIPT="/etc/openvpn/down.sh"
+LOG_FILE="/var/log/openvpn_smart_route.log"
 
 # 字体颜色
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; } # 红色
@@ -104,6 +107,8 @@ set_ipv6_takeover_policy() {
         hint "\n--- IPv6 出口策略 ---"
         echo "检测到您的服务器拥有原生IPv6地址 ($LAN6)。"
         hint "是否让 OpenVPN 完全接管所有 IPv6 出站流量？"
+        hint "选择 'y'，所有IPv6流量将走VPN (如果VPN支持IPv6)。"
+        hint "选择 'n' (默认)，服务器本身的IPv6流量(如SSH)将走原生网络，其他流量走VPN。"
         reading "让 OpenVPN 接管原生 IPv6 出口吗？[y/N]: " takeover_choice
         if [[ "${takeover_choice,,}" == "y" ]]; then
             OVPN_IPV6_TAKEOVER="y"
@@ -213,8 +218,14 @@ TABLE_ID=100
 GW4=\${route_vpn_gateway}
 GW6=\${ifconfig_ipv6_remote}
 
+# 确保日志文件存在且可写
+touch $LOG_FILE
+chmod 644 $LOG_FILE
+echo "\$(date): up.sh executing for device \$dev" >> $LOG_FILE
+
 # IPv4策略路由
 if [ -n "\$GW4" ]; then
+    echo "\$(date): VPN IPv4 Gateway is \$GW4" >> $LOG_FILE
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
     ip rule add from $LAN4 table main priority 100
     # 确保SSH连接始终走原生网络以防失联
@@ -224,11 +235,17 @@ fi
 
 # IPv6策略路由
 if [ -n "\$GW6" ]; then
+    # VPN提供IPv6，正常设置策略路由
+    echo "\$(date): VPN IPv6 Gateway is \$GW6. Setting up IPv6 policy routing." >> $LOG_FILE
     ip -6 route add default via \$GW6 dev \$dev table \$TABLE_ID
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
         ip -6 rule add from $LAN6 table main priority 100
     fi
     ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
+else
+    # VPN不提供IPv6，则添加blackhole规则以禁用所有IPv6出口
+    echo "\$(date): No VPN IPv6 Gateway detected. Blocking all IPv6 egress." >> $LOG_FILE
+    ip -6 rule add blackhole priority 99
 fi
 EOF
 
@@ -237,13 +254,25 @@ EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin
 TABLE_ID=100
+echo "\$(date): down.sh executing for device \$dev. Cleaning up rules..." >> $LOG_FILE
+
+# 清理IPv4规则
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+
+# 清理IPv6规则
 if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
     ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 fi
 ip -6 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+
+# 同时清理可能添加的IPv6 blackhole规则
+ip -6 rule del blackhole priority 99 2>/dev/null
+
+# 清空策略路由表，这是一个好习惯
+ip route flush table \$TABLE_ID 2>/dev/null
+echo "\$(date): Cleanup complete." >> $LOG_FILE
 EOF
 
     chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
@@ -297,6 +326,9 @@ uninstall_ovpn() {
     info "正在删除配置文件和脚本..."
     rm -rf "$OVPN_CONFIG_DIR" "$OVPN_AUTH_FILE" "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
+    info "正在清理日志文件..."
+    rm -f "$LOG_FILE"
+    
     if [ "$prompt" = "prompt" ]; then
         reading "是否要卸载 openvpn 软件包？[y/N]: " uninstall_deps
         if [[ "${uninstall_deps,,}" == "y" ]]; then
@@ -338,7 +370,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.3"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.4"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
