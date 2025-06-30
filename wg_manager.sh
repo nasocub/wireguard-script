@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 
 #
-# 通用WireGuard管理脚本 (基于fscarmen/warp-sh修改)
-# 版本: 1.5
-# 更新日志:
-# v1.5: 1.新增IPv6出口接管策略，允许WG的IPv6完全替代原生IPv6出口。2.增强接口清理机制，修复'wg0 already exists'错误。
-# v1.4: 新增设置出站协议优先级(IPv4/IPv6)的功能。
-# v1.3: 增加在安装时自动检测并启用系统级IPv6支持的功能。
-# v1.2: 修复了在OpenVZ/LXC等容器化环境中IP地址分配失败的问题。
-# v1.1: 修复了因缺少`resolvconf`依赖而启动失败的问题。
+# 通用OpenVPN智能路由管理脚本
+# 版本: 1.1
 #
-# 功能: 手动配置WireGuard接口，并智能配置策略路由，
-#      实现仅出站流量走WireGuard，不影响入站服务。
+# 更新日志:
+# v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
+#
+# 功能:
+# 1. 支持通过文件路径或直接粘贴内容来使用标准的.ovpn配置文件。
+# 2. 通过策略路由，仅将服务器出站流量通过OpenVPN发送，不影响入站服务。
+# 3. 支持在双栈服务器上，选择是否让OpenVPN完全接管IPv6出口。
+# 4. 自动处理需要用户名/密码认证的配置文件。
+# 5. 提供菜单式管理界面。
 #
 
 # --- 全局变量和函数 ---
 export DEBIAN_FRONTEND=noninteractive
+OVPN_CONFIG_DIR="/etc/openvpn/client"
+OVPN_CONFIG_NAME="client.conf"
+OVPN_AUTH_FILE="/etc/openvpn/auth.txt"
+OVPN_UP_SCRIPT="/etc/openvpn/up.sh"
+OVPN_DOWN_SCRIPT="/etc/openvpn/down.sh"
 
 # 字体颜色
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; } # 红色
@@ -56,15 +62,8 @@ check_operating_system() {
 
 check_dependencies() {
     hint "正在检查并安装必要的依赖..."
-    DEPS_CHECK=("ping" "wget" "curl" "ip")
-    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2")
-    
-    # 为Debian/Ubuntu系统添加resolvconf依赖检查
-    if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
-        DEPS_CHECK+=("resolvconf")
-        DEPS_INSTALL+=("resolvconf")
-    fi
-    
+    DEPS_CHECK=("ping" "curl" "ip" "openvpn")
+    DEPS_INSTALL=("iputils-ping" "curl" "iproute2" "openvpn")
     DEPS_TO_INSTALL=()
 
     for i in "${!DEPS_CHECK[@]}"; do
@@ -72,9 +71,6 @@ check_dependencies() {
              DEPS_TO_INSTALL+=(${DEPS_INSTALL[i]})
         fi
     done
-
-    # 移除可能存在的重复项
-    DEPS_TO_INSTALL=($(printf "%s\n" "${DEPS_TO_INSTALL[@]}" | sort -u | tr '\n' ' '))
 
     if [ "${#DEPS_TO_INSTALL[@]}" -ge 1 ];
     then
@@ -85,273 +81,225 @@ check_dependencies() {
         info "所有基本依赖已满足。"
     fi
     
-    # 检查并安装wireguard-tools
-    if ! type -p wg-quick > /dev/null; then
-        info "正在安装 wireguard-tools..."
-        ${PACKAGE_INSTALL[int]} wireguard-tools >/dev/null 2>&1
-        if ! type -p wg-quick > /dev/null; then
-            error "错误：wireguard-tools 安装失败，请手动安装后重试。"
-        fi
-    else
-        info "wireguard-tools 已安装。"
+    if ! type -p openvpn > /dev/null; then
+        error "错误：OpenVPN 安装失败，请手动安装后重试。"
     fi
 }
 
 enable_ipv6() {
-    if [ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
-        if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" -eq 1 ]; then
-            info "检测到系统已禁用IPv6，正在为您启用..."
-            sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-            sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
-            sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
-            echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
-            echo "net.ipv6.conf.default.disable_ipv6 = 0" >> /etc/sysctl.conf
-            echo "net.ipv6.conf.lo.disable_ipv6 = 0" >> /etc/sysctl.conf
-            sysctl -p >/dev/null 2>&1
-            info "系统级IPv6已启用。"
-        fi
+    if [ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ] && [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" -eq 1 ]; then
+        info "检测到系统已禁用IPv6，正在为您启用..."
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0
+        sysctl -w net.ipv6.conf.default.disable_ipv6=0
+        info "系统级IPv6已临时启用。为保证重启后生效，请手动修改 /etc/sysctl.conf 文件。"
     fi
 }
 
-# 2. 获取用户输入的WireGuard配置
-manual_input_config() {
-    hint "\n--- 请输入您的 WireGuard [Interface] 配置 ---\n"
-    reading "接口私钥 (PrivateKey): " WG_PRIVATE_KEY
-    reading "接口地址 (Address, 多个用逗号隔开 e.g., 10.0.0.2/24,fd00::2/64): " WG_ADDRESS
-    reading "接口DNS (可选, 默认 1.1.1.1,8.8.8.8): " WG_DNS
-    WG_DNS=${WG_DNS:-"1.1.1.1,8.8.8.8"}
-
-    hint "\n--- 请输入您的 WireGuard [Peer] 配置 ---\n"
-    reading "Peer公钥 (PublicKey): " PEER_PUBLIC_KEY
-    reading "Peer预共享密钥 (PresharedKey, 可选): " PEER_PRESHARED_KEY
-    reading "Peer端点 (Endpoint, e.g., your.server.com:51820): " PEER_ENDPOINT
-    reading "Peer允许的IP (AllowedIPs, 默认 0.0.0.0/0,::/0): " PEER_ALLOWED_IPS
-    PEER_ALLOWED_IPS=${PEER_ALLOWED_IPS:-"0.0.0.0/0,::/0"}
-    reading "持久连接 (PersistentKeepalive, 可选, 建议 25): " PEER_KEEPALIVE
-
-    # 验证输入
-    [ -z "$WG_PRIVATE_KEY" ] && error "错误：接口私钥(PrivateKey)不能为空。"
-    [ -z "$WG_ADDRESS" ] && error "错误：接口地址(Address)不能为空。"
-    [ -z "$PEER_PUBLIC_KEY" ] && error "错误：Peer公钥(PublicKey)不能为空。"
-    [ -z "$PEER_ENDPOINT" ] && error "错误：Peer端点(Endpoint)不能为空。"
-}
-
-# [v1.5 新增] 设置IPv6接管策略
 set_ipv6_takeover_policy() {
-    WG_IPV6_TAKEOVER="n" # 默认为不接管
+    OVPN_IPV6_TAKEOVER="n" # 默认为不接管
+    LAN6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1)
     if [ -n "$LAN6" ]; then
         hint "\n--- IPv6 出口策略 ---"
         echo "检测到您的服务器拥有原生IPv6地址 ($LAN6)。"
-        hint "是否让 WireGuard 完全接管所有 IPv6 出站流量？"
-        echo " - 选择 'y'，所有IPv6流量将通过WireGuard出口。这会使用WireGuard的IPv6地址访问网络。"
-        echo " - 选择 'n'，脚本将保留原生IPv6地址作为出口。这适合需要从固定原生IP访问某些服务的场景。"
-        reading "让 WireGuard 接管原生 IPv6 出口吗？[y/N]: " takeover_choice
+        hint "是否让 OpenVPN 完全接管所有 IPv6 出站流量？"
+        reading "让 OpenVPN 接管原生 IPv6 出口吗？[y/N]: " takeover_choice
         if [[ "${takeover_choice,,}" == "y" ]]; then
-            WG_IPV6_TAKEOVER="y"
+            OVPN_IPV6_TAKEOVER="y"
         fi
     fi
 }
 
-
-# 3. 生成配置文件并设置路由
-install_wg() {
-    # 如果已存在配置，先执行卸载流程进行清理
-    if [ -f /etc/wireguard/wg0.conf ]; then
-        warning "检测到已存在的 wg0.conf 配置文件。将先为您执行清理..."
-        uninstall_wg "no-prompt"
+# 2. 安装和配置OpenVPN
+install_ovpn() {
+    if [ -f "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}" ]; then
+        warning "检测到已存在的OpenVPN配置。将先为您执行清理..."
+        uninstall_ovpn "no-prompt"
         info "清理完成，现在开始新的安装。"
     fi
+    
+    mkdir -p "$OVPN_CONFIG_DIR"
 
-    info "正在生成 WireGuard 配置文件..."
-    manual_input_config
+    # [v1.1] 新增选择配置方式
+    hint "--- OpenVPN 配置 ---"
+    echo "请选择提供 .ovpn 配置的方式:"
+    hint "1. 输入 .ovpn 文件的完整路径"
+    hint "2. 直接粘贴 .ovpn 文件的内容"
+    reading "请输入选项 [1-2]: " input_choice
 
-    # 如果配置中包含IPv6地址，则确保系统启用IPv6
-    if [[ "$WG_ADDRESS" == *":"* ]] || [[ "$PEER_ALLOWED_IPS" == *":"* ]]; then
+    case "$input_choice" in
+        1)
+            reading "请输入您的 .ovpn 配置文件的完整路径 (e.g., /root/myconfig.ovpn): " ovpn_file_path
+            if [ ! -f "$ovpn_file_path" ]; then
+                error "错误：找不到指定的 .ovpn 文件: $ovpn_file_path"
+            fi
+            cp "$ovpn_file_path" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+            ;;
+        2)
+            hint "请粘贴您的 .ovpn 文件内容。粘贴完成后，在新的一行输入 'OVPN_END' (区分大小写) 并按回车键来结束:"
+            temp_ovpn_file=$(mktemp)
+            while IFS= read -r line; do
+                if [[ "$line" == "OVPN_END" ]]; then
+                    break
+                fi
+                echo "$line" >> "$temp_ovpn_file"
+            done
+            if [ ! -s "$temp_ovpn_file" ]; then
+                rm "$temp_ovpn_file"
+                error "错误：没有粘贴任何内容。"
+            fi
+            mv "$temp_ovpn_file" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+            ;;
+        *)
+            error "无效选项。"
+            ;;
+    esac
+
+    # 检查是否需要IPv6支持
+    if grep -qE "tun-ipv6|proto (udp6|tcp6)" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
         enable_ipv6
     fi
     
-    # 获取服务器IP并询问IPv6接管策略
-    LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
-    LAN6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1)
     set_ipv6_takeover_policy
-    
-    mkdir -p /etc/wireguard
-    
-    # 写入基础配置
-    cat > /etc/wireguard/wg0.conf << EOF
-[Interface]
-PrivateKey = ${WG_PRIVATE_KEY}
-DNS = ${WG_DNS}
-EOF
 
-    # 写入路由策略 (核心部分)
-    POSTUP_RULES=""
-    POSTDOWN_RULES=""
+    # 修改.ovpn配置文件以适应脚本
+    sed -i '/^redirect-gateway/d' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    sed -i '/^dhcp-option DNS/d' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     
-    # 将IP地址分配移入PostUp，以兼容OpenVZ/LXC等环境
-    IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
-    for addr in "${ADDRS[@]}"; do
-        addr=$(echo "$addr" | xargs)
-        if [ -n "$addr" ]; then
-            POSTUP_RULES+="ip address add $addr dev %i; "
-            POSTDOWN_RULES+="ip address del $addr dev %i; "
-        fi
-    done
+    # 添加脚本钩子
+    echo -e "\n# Added by script for policy routing" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    echo "script-security 2" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    echo "route-noexec" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    echo "up $OVPN_UP_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    echo "down $OVPN_DOWN_SCRIPT" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
 
-    # IPv4 策略路由，保留原生IPv4入口
-    if [ -n "$LAN4" ]; then
-        POSTUP_RULES+="ip -4 rule add from ${LAN4} table main; "
-        POSTDOWN_RULES+="ip -4 rule del from ${LAN4} table main; "
-    fi
-
-    # [v1.5] 根据用户选择决定IPv6策略
-    if [ -n "$LAN6" ]; then
-        if [ "$WG_IPV6_TAKEOVER" != "y" ]; then
-            POSTUP_RULES+="ip -6 rule add from ${LAN6} table main; "
-            POSTDOWN_RULES+="ip -6 rule del from ${LAN6} table main; "
-            info "已配置保留原生 IPv6 出口。"
-        else
-            info "已配置 WireGuard IPv6 接管原生出口。"
+    # 处理用户认证
+    if grep -q "auth-user-pass" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+        if ! grep -q "auth-user-pass $OVPN_AUTH_FILE" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+            hint "检测到您的配置需要用户名和密码认证。"
+            reading "请输入用户名: " ovpn_user
+            reading "请输入密码: " ovpn_pass
+            echo "$ovpn_user" > "$OVPN_AUTH_FILE"
+            echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
+            chmod 600 "$OVPN_AUTH_FILE"
+            sed -i "s|auth-user-pass$|auth-user-pass $OVPN_AUTH_FILE|" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
         fi
     fi
+    
+    # 创建up脚本
+    LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
+    
+    cat > "$OVPN_UP_SCRIPT" << EOF
+#!/bin/bash
+export PATH=\${PATH}:/usr/sbin
+# 路由表号
+TABLE_ID=100
+# 获取OpenVPN推送的网关
+GW4=\${route_vpn_gateway}
+GW6=\${ifconfig_ipv6_remote}
 
-    # Docker 容器的流量也走主路由表
-    POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main 2>/dev/null; "
-    POSTDOWN_RULES+="ip -4 rule del from 172.17.0.0/16 table main 2>/dev/null; "
+# IPv4策略路由
+if [ -n "\$GW4" ]; then
+    ip route add default via \$GW4 dev \$dev table \$TABLE_ID
+    ip rule add from $LAN4 table main priority 100
+    ip rule add ipproto tcp dport 22 table main priority 101
+    ip rule add not fwmark 0x2a table \$TABLE_ID priority 102
+fi
 
-    # 写入PostUp和PostDown
-    echo "PostUp = ${POSTUP_RULES}" >> /etc/wireguard/wg0.conf
-    echo "PostDown = ${POSTDOWN_RULES}" >> /etc/wireguard/wg0.conf
-
-    # 写入Peer配置
-    cat >> /etc/wireguard/wg0.conf << EOF
-
-[Peer]
-PublicKey = ${PEER_PUBLIC_KEY}
-Endpoint = ${PEER_ENDPOINT}
-AllowedIPs = ${PEER_ALLOWED_IPS}
+# IPv6策略路由
+if [ -n "\$GW6" ]; then
+    ip -6 route add default via \$GW6 dev \$dev table \$TABLE_ID
+    if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
+        ip -6 rule add from $LAN6 table main priority 100
+    fi
+    ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
+fi
 EOF
 
-    if [ -n "$PEER_PRESHARED_KEY" ]; then
-        echo "PresharedKey = ${PEER_PRESHARED_KEY}" >> /etc/wireguard/wg0.conf
-    fi
-    if [ -n "$PEER_KEEPALIVE" ]; then
-        echo "PersistentKeepalive = ${PEER_KEEPALIVE}" >> /etc/wireguard/wg0.conf
-    fi
+    # 创建down脚本
+    cat > "$OVPN_DOWN_SCRIPT" << EOF
+#!/bin/bash
+export PATH=\${PATH}:/usr/sbin
+TABLE_ID=100
+ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
+ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
+ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+if [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
+    ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
+fi
+ip -6 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
+EOF
 
-    info "配置文件 /etc/wireguard/wg0.conf 已生成。"
+    chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
-    # [v1.5] 增强启动流程以提高稳定性
-    info "正在停止任何可能存在的 wg0 接口以确保环境干净..."
-    systemctl stop wg-quick@wg0 >/dev/null 2>&1
-    # 强制删除可能卡住的接口
-    ip link delete wg0 2>/dev/null
-    sleep 1
+    info "配置完成。正在启动OpenVPN..."
+    systemctl enable "openvpn-client@${OVPN_CONFIG_NAME%.*}"
+    systemctl restart "openvpn-client@${OVPN_CONFIG_NAME%.*}"
 
-    systemctl enable wg-quick@wg0 >/dev/null 2>&1
-    info "正在启动新的 wg0 接口..."
-    systemctl start wg-quick@wg0
-
-    sleep 3
-    if systemctl is-active --quiet wg-quick@wg0; then
-        info "WireGuard (wg0) 接口已成功启动！"
+    sleep 5
+    if systemctl is-active --quiet "openvpn-client@${OVPN_CONFIG_NAME%.*}"; then
+        info "OpenVPN 客户端已成功启动！"
         show_status
     else
-        error "错误：WireGuard (wg0) 接口启动失败。请检查配置或使用 'journalctl -u wg-quick@wg0' 查看日志。"
+        error "错误：OpenVPN 客户端启动失败。请使用 'journalctl -u openvpn-client@${OVPN_CONFIG_NAME%.*}' 查看日志。"
     fi
 }
 
-# 4. 其他管理功能
+# 3. 其他管理功能
 on_off() {
-    if [ ! -f /etc/wireguard/wg0.conf ]; then
-        error "错误：配置文件 /etc/wireguard/wg0.conf 不存在，请先安装。"
+    if [ ! -f "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}" ]; then
+        error "错误：找不到OpenVPN配置文件，请先安装。"
     fi
     
-    if systemctl is-active --quiet wg-quick@wg0; then
-        hint "正在关闭 WireGuard (wg0) 接口..."
-        wg-quick down wg0
-        info "接口已关闭。"
+    if systemctl is-active --quiet "openvpn-client@${OVPN_CONFIG_NAME%.*}"; then
+        hint "正在关闭 OpenVPN 客户端..."
+        systemctl stop "openvpn-client@${OVPN_CONFIG_NAME%.*}"
+        info "客户端已关闭。"
     else
-        hint "正在启动 WireGuard (wg0) 接口..."
-        wg-quick up wg0
-        info "接口已启动。"
+        hint "正在启动 OpenVPN 客户端..."
+        systemctl start "openvpn-client@${OVPN_CONFIG_NAME%.*}"
+        info "客户端已启动。"
     fi
 }
 
-set_priority() {
-    hint "\n--- 设置出站网络优先级 ---"
-    echo "当前系统在访问双栈(IPv4/IPv6)网站时，会优先使用哪个协议？"
-    hint "1. 优先使用 IPv4 (默认)"
-    hint "2. 优先使用 IPv6"
-    hint "0. 返回主菜单"
-    reading "请输入选项 [0-2]: " priority_choice
-
-    # 先清除旧的配置
-    if [ -f /etc/gai.conf ]; then
-        sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
-        sed -i '/^label 2002::\/16/d' /etc/gai.conf
-    fi
-
-    case "$priority_choice" in
-        1)
-            echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-            info "已设置优先使用 IPv4 出站。"
-            ;;
-        2)
-            echo "label 2002::/16   2" >> /etc/gai.conf
-            info "已设置优先使用 IPv6 出站。"
-            ;;
-        0)
-            return
-            ;;
-        *)
-            warning "无效输入。"
-            ;;
-    esac
-    sleep 2
-}
-
-uninstall_wg() {
-    local prompt=${1:-"prompt"} # 接收一个可选参数来跳过确认提示
+uninstall_ovpn() {
+    local prompt=${1:-"prompt"}
     
     if [ "$prompt" = "prompt" ]; then
-        hint "你确定要卸载 WireGuard 接口并删除配置文件吗？"
+        hint "你确定要卸载 OpenVPN 客户端并删除所有相关配置吗？"
         reading "[y/N]: " confirm
         if [[ "${confirm,,}" != "y" ]]; then
             info "操作已取消。"
-            exit 0
+            return
         fi
     fi
     
     info "正在停止并禁用服务..."
-    systemctl stop wg-quick@wg0 >/dev/null 2>&1
-    systemctl disable wg-quick@wg0 >/dev/null 2>&1
+    systemctl stop "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
+    systemctl disable "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
     
-    info "正在删除配置文件..."
-    rm -f /etc/wireguard/wg0.conf
+    info "正在删除配置文件和脚本..."
+    rm -rf "$OVPN_CONFIG_DIR" "$OVPN_AUTH_FILE" "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
     if [ "$prompt" = "prompt" ]; then
-        # 询问是否卸载wireguard-tools
-        reading "是否要卸载 wireguard-tools 依赖包？[y/N]: " uninstall_deps
+        reading "是否要卸载 openvpn 软件包？[y/N]: " uninstall_deps
         if [[ "${uninstall_deps,,}" == "y" ]]; then
-            info "正在卸载 wireguard-tools..."
-            ${PACKAGE_UNINSTALL[int]} wireguard-tools >/dev/null 2>&1
+            info "正在卸载 openvpn..."
+            ${PACKAGE_UNINSTALL[int]} openvpn >/dev/null 2>&1
         fi
         info "卸载完成。"
     fi
 }
 
 show_status() {
-    if ! systemctl is-active --quiet wg-quick@wg0; then
-        warning "WireGuard (wg0) 接口当前未运行。"
+    if ! systemctl is-active --quiet "openvpn-client@${OVPN_CONFIG_NAME%.*}"; then
+        warning "OpenVPN 客户端当前未运行。"
         return
     fi
     
-    info "\n--- WireGuard 状态 ---"
-    wg show wg0
+    info "\n--- OpenVPN 状态 ---"
+    systemctl status "openvpn-client@${OVPN_CONFIG_NAME%.*}" | grep "Active:"
     
     hint "\n--- 网络连通性测试 ---"
-    # 使用ip.sb进行测试，因为它同时支持v4和v6
     IPV4_IP=$(curl -s -4 --connect-timeout 5 https://api.ip.sb/ip)
     IPV6_IP=$(curl -s -6 --connect-timeout 5 https://api.ip.sb/ip)
     
@@ -373,25 +321,23 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 WireGuard 智能路由管理脚本 v1.5"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.1"
     echo "=============================================="
-    hint "1. 安装或重装一个新的 WireGuard 接口 (wg0)"
-    hint "2. 启动 / 关闭 WireGuard 接口"
-    hint "3. 查看 WireGuard 状态和网络"
-    hint "4. 设置出站优先级 (IPv4/IPv6)"
-    hint "5. 彻底卸载 WireGuard 接口"
+    hint "1. 安装并配置一个新的 OpenVPN 客户端"
+    hint "2. 启动 / 关闭 OpenVPN 客户端"
+    hint "3. 查看 OpenVPN 状态和网络"
+    hint "4. 彻底卸载 OpenVPN"
     hint "0. 退出脚本"
     echo "----------------------------------------------"
-    reading "请输入选项 [0-5]: " choice
+    reading "请输入选项 [0-4]: " choice
 
     case "$choice" in
-        1) install_wg ;;
+        1) install_ovpn ;;
         2) on_off ;;
         3) show_status ;;
-        4) set_priority ;;
-        5) uninstall_wg ;;
+        4) uninstall_ovpn ;;
         0) exit 0 ;;
-        *) warning "无效输入，请输入 0-5 之间的数字。" && sleep 2 ;;
+        *) warning "无效输入，请输入 0-4 之间的数字。" && sleep 2 ;;
     esac
 }
 
