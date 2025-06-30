@@ -2,9 +2,10 @@
 
 #
 # 通用OpenVPN智能路由管理脚本
-# 版本: 1.1
+# 版本: 1.2
 #
 # 更新日志:
+# v1.2: 自动注释掉.ovpn文件中不兼容的'block-outside-dns'指令，修复启动失败问题。
 # v1.1: 新增安装时直接粘贴.ovpn内容的功能，无需预先上传文件。
 #
 # 功能:
@@ -119,7 +120,7 @@ install_ovpn() {
     
     mkdir -p "$OVPN_CONFIG_DIR"
 
-    # [v1.1] 新增选择配置方式
+    # 新增选择配置方式
     hint "--- OpenVPN 配置 ---"
     echo "请选择提供 .ovpn 配置的方式:"
     hint "1. 输入 .ovpn 文件的完整路径"
@@ -162,8 +163,11 @@ install_ovpn() {
     set_ipv6_takeover_policy
 
     # 修改.ovpn配置文件以适应脚本
+    # 移除与策略路由冲突的指令
     sed -i '/^redirect-gateway/d' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     sed -i '/^dhcp-option DNS/d' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+    # [v1.2] 注释掉不兼容的 block-outside-dns 指令
+    sed -i 's/^\s*block-outside-dns/#&/' "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
     
     # 添加脚本钩子
     echo -e "\n# Added by script for policy routing" >> "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
@@ -174,14 +178,15 @@ install_ovpn() {
 
     # 处理用户认证
     if grep -q "auth-user-pass" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
-        if ! grep -q "auth-user-pass $OVPN_AUTH_FILE" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
+        # 仅当没有指定文件时才提示输入
+        if ! grep -q "auth-user-pass .*$" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"; then
             hint "检测到您的配置需要用户名和密码认证。"
             reading "请输入用户名: " ovpn_user
             reading "请输入密码: " ovpn_pass
             echo "$ovpn_user" > "$OVPN_AUTH_FILE"
             echo "$ovpn_pass" >> "$OVPN_AUTH_FILE"
             chmod 600 "$OVPN_AUTH_FILE"
-            sed -i "s|auth-user-pass$|auth-user-pass $OVPN_AUTH_FILE|" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
+            sed -i "s|^\s*auth-user-pass\s*$|auth-user-pass $OVPN_AUTH_FILE|" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}"
         fi
     fi
     
@@ -201,6 +206,7 @@ GW6=\${ifconfig_ipv6_remote}
 if [ -n "\$GW4" ]; then
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
     ip rule add from $LAN4 table main priority 100
+    # 确保SSH连接始终走原生网络以防失联
     ip rule add ipproto tcp dport 22 table main priority 101
     ip rule add not fwmark 0x2a table \$TABLE_ID priority 102
 fi
@@ -232,7 +238,7 @@ EOF
     chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
     info "配置完成。正在启动OpenVPN..."
-    systemctl enable "openvpn-client@${OVPN_CONFIG_NAME%.*}"
+    systemctl enable "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
     systemctl restart "openvpn-client@${OVPN_CONFIG_NAME%.*}"
 
     sleep 5
@@ -321,7 +327,7 @@ show_status() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 OpenVPN 智能路由管理脚本 v1.1"
+    echo "      通用 OpenVPN 智能路由管理脚本 v1.2"
     echo "=============================================="
     hint "1. 安装并配置一个新的 OpenVPN 客户端"
     hint "2. 启动 / 关闭 OpenVPN 客户端"
