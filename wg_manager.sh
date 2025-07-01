@@ -2,10 +2,9 @@
 
 #
 # 通用 VPN 智能路由管理脚本 (合并版)
-# 版本: 2.2 (新增端口绕过功能)
+# 版本: 2.1
 #
 # 更新日志:
-# v2.2: 增加特定端口绕过VPN功能，允许指定端口流量走VPS原生IP。
 # v2.1: 改进状态检查，使用 ifconfig.co 显示更详细的出站 IP 和服务商信息。
 # v2.0: 合并 WireGuard 和 OpenVPN 脚本，提供统一管理菜单。
 #
@@ -15,7 +14,6 @@
 # 3. 智能配置策略路由，仅将服务器的出站流量通过VPN发送，不影响入站服务。
 # 4. 完整保留各协议原有的IPv6处理逻辑。
 # 5. 提供菜单式管理界面，易于操作。
-# 6. 新增特定端口绕过VPN功能，使指定端口流量直接走VPS原生IP。
 #
 
 # --- 全局变量和通用函数 ---
@@ -29,14 +27,11 @@ OVPN_UP_SCRIPT="/etc/openvpn/up.sh"
 OVPN_DOWN_SCRIPT="/etc/openvpn/down.sh"
 LOG_FILE="/var/log/openvpn_smart_route.log"
 
-# --- 新增全局变量：端口绕过 ---
-BYPASS_PORTS="" # 存储需要绕过VPN的端口，逗号分隔
-
 # --- 字体颜色 ---
-warning() { echo -e "\033[31m\033[01m$*\\033[0m"; } # 红色
-error() { echo -e "\033[31m\\033[01m$*\\033[0m" && exit 1; } # 红色并退出
-info() { echo -e "\033[32m\\033[01m$*\\033[0m"; }  # 绿色
-hint() { echo -e "\033[33m\\033[01m$*\\033[0m"; }  # 黄色
+warning() { echo -e "\033[31m\033[01m$*\033[0m"; } # 红色
+error() { echo -e "\033[31m\033[01m$*\033[0m" && exit 1; } # 红色并退出
+info() { echo -e "\033[32m\033[01m$*\033[0m"; }  # 绿色
+hint() { echo -e "\033[33m\033[01m$*\033[0m"; }  # 黄色
 reading() { read -rp "$(info "$1")" "$2"; }
 
 # --- 通用核心功能函数 ---
@@ -71,8 +66,8 @@ check_operating_system() {
 # 合并后的依赖检查
 check_dependencies() {
     hint "正在检查并安装必要的依赖..."
-    DEPS_CHECK=("ping" "wget" "curl" "ip" "openvpn" "wg-quick" "iptables") # 添加 iptables
-    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2" "openvpn" "wireguard-tools" "iptables") # 添加 iptables
+    DEPS_CHECK=("ping" "wget" "curl" "ip" "openvpn" "wg-quick")
+    DEPS_INSTALL=("iputils-ping" "wget" "curl" "iproute2" "openvpn" "wireguard-tools")
     
     if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
         DEPS_CHECK+=("resolvconf")
@@ -104,9 +99,6 @@ check_dependencies() {
     fi
     if ! type -p wg-quick > /dev/null; then
         warning "警告：wireguard-tools 安装失败，相关功能可能无法使用。"
-    fi
-    if ! type -p iptables > /dev/null; then
-        warning "警告：iptables 安装失败，端口绕过功能可能无法使用。"
     fi
 }
 
@@ -143,9 +135,6 @@ wg_manual_input_config() {
     reading "Peer允许的IP (AllowedIPs, 默认 0.0.0.0/0,::/0): " PEER_ALLOWED_IPS
     PEER_ALLOWED_IPS=${PEER_ALLOWED_IPS:-"0.0.0.0/0,::/0"}
     reading "持久连接 (PersistentKeepalive, 可选, 建议 25): " PEER_KEEPALIVE
-
-    # 新增端口绕过输入
-    reading "请输入需要绕过VPN的端口 (多个用逗号隔开, 例如: 80,443, 如果不需要则留空): " BYPASS_PORTS
 
     [ -z "$WG_PRIVATE_KEY" ] && error "错误：接口私钥(PrivateKey)不能为空。"
     [ -z "$WG_ADDRESS" ] && error "错误：接口地址(Address)不能为空。"
@@ -225,33 +214,8 @@ EOF
         fi
     fi
 
-    # Docker 桥接网络流量绕过VPN
     POSTUP_RULES+="ip -4 rule add from 172.17.0.0/16 table main 2>/dev/null; "
     POSTDOWN_RULES+="ip -4 rule del from 172.17.0.0/16 table main 2>/dev/null; "
-
-    # 端口绕过VPN的规则
-    if [ -n "$BYPASS_PORTS" ]; then
-        info "正在为指定端口配置绕过VPN的规则: $BYPASS_PORTS"
-        # IPv4 端口绕过
-        POSTUP_RULES+="iptables -t mangle -A OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-        POSTUP_RULES+="iptables -t mangle -A OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-        POSTUP_RULES+="ip rule add fwmark 1 table main priority 90; " # 优先级高于VPN规则 (102)
-
-        POSTDOWN_RULES+="ip rule del fwmark 1 table main priority 90; "
-        POSTDOWN_RULES+="iptables -t mangle -D OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-        POSTDOWN_RULES+="iptables -t mangle -D OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-        
-        # IPv6 端口绕过 (如果系统支持IPv6)
-        if [ -n "$LAN6" ]; then
-            POSTUP_RULES+="ip6tables -t mangle -A OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-            POSTUP_RULES+="ip6tables -t mangle -A OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-            POSTUP_RULES+="ip -6 rule add fwmark 1 table main priority 90; "
-
-            POSTDOWN_RULES+="ip -6 rule del fwmark 1 table main priority 90; "
-            POSTDOWN_RULES+="ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-            POSTDOWN_RULES+="ip6tables -t mangle -D OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1; "
-        fi
-    fi
 
     echo "PostUp = ${POSTUP_RULES}" >> /etc/wireguard/wg0.conf
     echo "PostDown = ${POSTDOWN_RULES}" >> /etc/wireguard/wg0.conf
@@ -322,25 +286,6 @@ wg_uninstall() {
     info "正在删除配置文件..."
     rm -f /etc/wireguard/wg0.conf
     
-    # 清理 WireGuard 相关的 iptables 规则和 ip rule
-    info "正在清理 WireGuard 相关的 iptables 规则和 ip rule..."
-    # 假设 WireGuard 规则使用了 TABLE_ID 100 和 fwmark 0x2a
-    ip -4 rule del from 172.17.0.0/16 table main 2>/dev/null
-    ip -4 rule del from $(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1) table main 2>/dev/null
-    ip -6 rule del from $(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1) table main 2>/dev/null
-    ip -4 rule del not fwmark 0x2a table 100 priority 102 2>/dev/null
-    ip -6 rule del not fwmark 0x2a table 100 priority 102 2>/dev/null
-
-    # 清理端口绕过规则 (如果存在)
-    if [ -n "$BYPASS_PORTS" ]; then
-        ip rule del fwmark 1 table main priority 90 2>/dev/null
-        ip -6 rule del fwmark 1 table main priority 90 2>/dev/null
-        iptables -t mangle -D OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-        iptables -t mangle -D OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-    fi
-
     if [ "$prompt" = "prompt" ]; then
         reading "是否要卸载 wireguard-tools 依赖包？[y/N]: " uninstall_deps
         if [[ "${uninstall_deps,,}" == "y" ]]; then
@@ -436,9 +381,6 @@ open_install() {
         *) error "无效选项。" ;;
     esac
 
-    # 新增端口绕过输入
-    reading "请输入需要绕过VPN的端口 (多个用逗号隔开, 例如: 80,443, 如果不需要则留空): " BYPASS_PORTS
-
     grep -qE "tun-ipv6|proto (udp6|tcp6)" "${OVPN_CONFIG_DIR}/${OVPN_CONFIG_NAME}" && enable_ipv6
     
     open_set_ipv6_takeover_policy
@@ -470,7 +412,6 @@ open_install() {
     fi
     
     LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
-    LAN6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{print $10}' | head -n1)
     
     cat > "$OVPN_UP_SCRIPT" << EOF
 #!/bin/bash
@@ -481,20 +422,6 @@ GW6=\${ifconfig_ipv6_remote}
 
 touch $LOG_FILE && chmod 644 $LOG_FILE
 echo "\$(date): up.sh executing for device \$dev" >> $LOG_FILE
-
-# 添加端口绕过规则 (优先级 90)
-if [ -n "$BYPASS_PORTS" ]; then
-    echo "\$(date): Adding bypass rules for ports: $BYPASS_PORTS" >> $LOG_FILE
-    iptables -t mangle -A OUTPUT -p tcp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1
-    iptables -t mangle -A OUTPUT -p udp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1
-    ip rule add fwmark 1 table main priority 90
-    
-    if [ -n "$LAN6" ]; then
-        ip6tables -t mangle -A OUTPUT -p tcp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1
-        ip6tables -t mangle -A OUTPUT -p udp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1
-        ip -6 rule add fwmark 1 table main priority 90
-    fi
-fi
 
 if [ -n "\$GW4" ]; then
     echo "\$(date): VPN IPv4 Gateway is \$GW4" >> $LOG_FILE
@@ -522,20 +449,6 @@ EOF
 export PATH=\${PATH}:/usr/sbin
 TABLE_ID=100
 echo "\$(date): down.sh executing for device \$dev. Cleaning up..." >> $LOG_FILE
-
-# 删除端口绕过规则
-if [ -n "$BYPASS_PORTS" ]; then
-    echo "\$(date): Deleting bypass rules for ports: $BYPASS_PORTS" >> $LOG_FILE
-    ip rule del fwmark 1 table main priority 90 2>/dev/null
-    iptables -t mangle -D OUTPUT -p tcp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1 2>/dev/null
-    iptables -t mangle -D OUTPUT -p udp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1 2>/dev/null
-    
-    if [ -n "$LAN6" ]; then
-        ip -6 rule del fwmark 1 table main priority 90 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -p udp -m multiport --dports $BYPASS_PORTS -j MARK --set-mark 1 2>/dev/null
-    fi
-fi
 
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
@@ -599,26 +512,6 @@ open_uninstall() {
     rm -rf "$OVPN_CONFIG_DIR" "$OVPN_AUTH_FILE" "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     rm -f "$LOG_FILE"
     
-    # 清理 OpenVPN 相关的 iptables 规则和 ip rule
-    info "正在清理 OpenVPN 相关的 iptables 规则和 ip rule..."
-    # 假设 OpenVPN 规则使用了 TABLE_ID 100 和 fwmark 0x2a
-    ip -4 rule del from $(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1) table main priority 100 2>/dev/null
-    ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
-    ip -4 rule del not fwmark 0x2a table 100 priority 102 2>/dev/null
-    ip -6 rule del not fwmark 0x2a table 100 priority 102 2>/dev/null
-    ip -6 rule del blackhole priority 99 2>/dev/null
-    ip route flush table 100 2>/dev/null
-
-    # 清理端口绕过规则 (如果存在)
-    if [ -n "$BYPASS_PORTS" ]; then
-        ip rule del fwmark 1 table main priority 90 2>/dev/null
-        ip -6 rule del fwmark 1 table main priority 90 2>/dev/null
-        iptables -t mangle -D OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-        iptables -t mangle -D OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -p tcp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-        ip6tables -t mangle -D OUTPUT -p udp -m multiport --dports ${BYPASS_PORTS} -j MARK --set-mark 1 2>/dev/null
-    fi
-
     if [ "$prompt" = "prompt" ]; then
         reading "是否要卸载 openvpn 软件包？[y/N]: " uninstall_deps
         if [[ "${uninstall_deps,,}" == "y" ]]; then
@@ -716,7 +609,7 @@ open_menu() {
         2) open_on_off ;;
         3) open_show_status ;;
         4) open_uninstall ;;
-        0) return ;;\
+        0) return ;;
         *) warning "无效输入。" && sleep 2 ;;
     esac
     [ "$choice" != "0" ] && open_menu
@@ -725,7 +618,7 @@ open_menu() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 VPN 智能路由管理脚本 v2.2"
+    echo "      通用 VPN 智能路由管理脚本 v2.1"
     echo "=============================================="
     info "当前活动服务:"
     if systemctl is-active --quiet wg-quick@wg0; then
