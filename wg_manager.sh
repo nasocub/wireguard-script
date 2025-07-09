@@ -2,9 +2,11 @@
 
 #
 # 通用 VPN 智能路由管理脚本 (合并版)
-# 版本: 2.1
+# 版本: 2.2
 #
 # 更新日志:
+# v2.2: 修复当VPS有IPv6而OpenVPN无IPv6时，出站IPv6流量被阻断的问题。
+#       现在会自动将IPv6流量封装在IPv4 VPN隧道中发出。
 # v2.1: 改进状态检查，使用 ifconfig.co 显示更详细的出站 IP 和服务商信息。
 # v2.0: 合并 WireGuard 和 OpenVPN 脚本，提供统一管理菜单。
 #
@@ -12,7 +14,7 @@
 # 1. 统一管理 WireGuard 和 OpenVPN 客户端。
 # 2. 允许用户选择使用 WireGuard 或 OpenVPN 作为出站代理。
 # 3. 智能配置策略路由，仅将服务器的出站流量通过VPN发送，不影响入站服务。
-# 4. 完整保留各协议原有的IPv6处理逻辑。
+# 4. 完整保留各协议原有的IPv6处理逻辑，并修复特殊场景下的连接问题。
 # 5. 提供菜单式管理界面，易于操作。
 #
 
@@ -413,6 +415,7 @@ open_install() {
     
     LAN4=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | head -n1)
     
+    # --- Start of UP script generation (MODIFIED) ---
     cat > "$OVPN_UP_SCRIPT" << EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin
@@ -423,6 +426,7 @@ GW6=\${ifconfig_ipv6_remote}
 touch $LOG_FILE && chmod 644 $LOG_FILE
 echo "\$(date): up.sh executing for device \$dev" >> $LOG_FILE
 
+# --- IPv4 Routing ---
 if [ -n "\$GW4" ]; then
     echo "\$(date): VPN IPv4 Gateway is \$GW4" >> $LOG_FILE
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
@@ -431,38 +435,51 @@ if [ -n "\$GW4" ]; then
     ip rule add not fwmark 0x2a table \$TABLE_ID priority 102
 fi
 
+# --- IPv6 Routing (MODIFIED LOGIC) ---
 if [ -n "\$GW6" ]; then
+    # Case 1: VPN provides a native IPv6 gateway.
     echo "\$(date): VPN IPv6 Gateway is \$GW6" >> $LOG_FILE
     ip -6 route add default via \$GW6 dev \$dev table \$TABLE_ID
     if [ "$OVPN_IPV6_TAKEOVER" != "y" ] && [ -n "$LAN6" ]; then
+        # If user chose not to, keep native IPv6 for server's own traffic.
         ip -6 rule add from $LAN6 table main priority 100
     fi
     ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
 else
-    echo "\$(date): No VPN IPv6 Gateway. Blocking all IPv6 egress." >> $LOG_FILE
-    ip -6 rule add blackhole priority 99
+    # Case 2: VPN does NOT provide an IPv6 gateway.
+    # Route all IPv6 egress via the VPN interface, to be encapsulated over IPv4.
+    # This ensures outbound IPv6 works even without a native VPN IPv6 connection.
+    echo "\$(date): No VPN IPv6 Gateway. Routing all IPv6 egress via VPN interface \$dev (encapsulated)." >> $LOG_FILE
+    ip -6 route add default dev \$dev table \$TABLE_ID
+    # This rule directs all IPv6 traffic (not otherwise matched) to the VPN.
+    ip -6 rule add not fwmark 0x2a table \$TABLE_ID priority 102
 fi
 EOF
+    # --- End of UP script generation ---
 
+    # --- Start of DOWN script generation (MODIFIED) ---
     cat > "$OVPN_DOWN_SCRIPT" << EOF
 #!/bin/bash
 export PATH=\${PATH}:/usr/sbin
 TABLE_ID=100
 echo "\$(date): down.sh executing for device \$dev. Cleaning up..." >> $LOG_FILE
 
+# Cleanup IPv4 rules
 ip -4 rule del from $LAN4 table main priority 100 2>/dev/null
 ip -4 rule del ipproto tcp dport 22 table main priority 101 2>/dev/null
 ip -4 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
 
+# Cleanup IPv6 rules
 if [ "$OVPN_IPV6_TAKEOVER" != "y" ] && [ -n "$LAN6" ]; then
     ip -6 rule del from $LAN6 table main priority 100 2>/dev/null
 fi
 ip -6 rule del not fwmark 0x2a table \$TABLE_ID priority 102 2>/dev/null
-ip -6 rule del blackhole priority 99 2>/dev/null
+# The blackhole rule is no longer added, so its deletion is removed.
 ip route flush table \$TABLE_ID 2>/dev/null
 
 echo "\$(date): Cleanup complete." >> $LOG_FILE
 EOF
+    # --- End of DOWN script generation ---
 
     chmod +x "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
     
@@ -618,7 +635,7 @@ open_menu() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 VPN 智能路由管理脚本 v2.1"
+    echo "      通用 VPN 智能路由管理脚本 v2.2"
     echo "=============================================="
     info "当前活动服务:"
     if systemctl is-active --quiet wg-quick@wg0; then
