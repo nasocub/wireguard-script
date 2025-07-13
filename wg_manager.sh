@@ -2,9 +2,12 @@
 
 #
 # 通用 VPN 智能路由管理脚本 (合并版)
-# 版本: 2.3 (修改以支持仅出站代理，不影响入站)
+# 版本: 2.4 (修复 WireGuard 启动问题，优化出站代理逻辑)
 #
 # 更新日志:
+# v2.4: 修复 WireGuard wg-quick 启动失败问题，将 PostUp/PostDown 逻辑移至独立脚本。
+#       统一 WireGuard 和 OpenVPN 的策略路由逻辑，确保仅代理出站，不影响入站。
+#       添加 SSH 流量（出站和入站）始终走主路由表的规则，确保可访问性。
 # v2.3: 优化策略路由，确保 VPN 仅代理服务器的出站流量，不影响 IPv4/IPv6 入站服务。
 #       移除可能导致入站问题的全局路由规则，采用更精细的 `ip rule` 策略。
 #       为 WireGuard 和 OpenVPN 统一实现“仅代理出站”逻辑。
@@ -31,6 +34,10 @@ OVPN_AUTH_FILE="/etc/openvpn/auth.txt"
 OVPN_UP_SCRIPT="/etc/openvpn/up.sh"
 OVPN_DOWN_SCRIPT="/etc/openvpn/down.sh"
 LOG_FILE="/var/log/openvpn_smart_route.log"
+
+# --- WireGuard 专用全局变量 ---
+WG_UP_SCRIPT="/etc/wireguard/wg-up.sh"
+WG_DOWN_SCRIPT="/etc/wireguard/wg-down.sh"
 
 # --- 字体颜色 ---
 warning() { echo -e "\033[31m\033[01m$*\033[0m"; } # 红色
@@ -137,9 +144,6 @@ wg_manual_input_config() {
     reading "Peer公钥 (PublicKey): " PEER_PUBLIC_KEY
     reading "Peer预共享密钥 (PresharedKey, 可选): " PEER_PRESHARED_KEY
     reading "Peer端点 (Endpoint, e.g., your.server.com:51820): " PEER_ENDPOINT
-    # PEER_ALLOWED_IPS will be managed by policy routing, but we still need a value for wg0.conf.
-    # For outbound-only, it's safer to set it to the peer's internal IP.
-    # However, if the user provides 0.0.0.0/0, we respect it but manage routing via PostUp/Down.
     reading "Peer允许的IP (AllowedIPs, 默认 0.0.0.0/0,::/0): " PEER_ALLOWED_IPS
     PEER_ALLOWED_IPS=${PEER_ALLOWED_IPS:-"0.0.0.0/0,::/0"}
     reading "持久连接 (PersistentKeepalive, 可选, 建议 25): " PEER_KEEPALIVE
@@ -196,73 +200,100 @@ wg_install() {
     
     mkdir -p /etc/wireguard
     
-    # Define TABLE_ID for policy routing
-    local TABLE_ID=100
+    # Generate wg-up.sh script
+    cat > "$WG_UP_SCRIPT" << EOF
+#!/bin/bash
+# WireGuard PostUp script for outbound-only policy routing
+export PATH=\${PATH}:/usr/sbin:/usr/bin
+TABLE_ID=100
 
-    # Start building PostUp and PostDown rules
-    # We will clear existing rules for this table/priority before adding new ones
-    POSTUP_RULES="ip rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null; "
-    POSTUP_RULES+="ip -6 rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null; "
-    POSTUP_RULES+="ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null; " # Clean up SSH rule
-    POSTUP_RULES+="ip route flush table ${TABLE_ID} 2>/dev/null; " # Clear routes in the custom table
+echo "\$(date): wg-up.sh executing for device \$1" >> "$LOG_FILE"
 
-    POSTDOWN_RULES="ip rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null; "
-    POSTDOWN_RULES+="ip -6 rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null; "
-    POSTDOWN_RULES+="ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null; " # Clean up SSH rule
-    POSTDOWN_RULES+="ip route flush table ${TABLE_ID} 2>/dev/null; " # Clear routes in the custom table
+# Flush custom table to ensure clean state
+ip route flush table \$TABLE_ID 2>/dev/null
+ip -6 route flush table \$TABLE_ID 2>/dev/null
 
-    # Add interface addresses
-    IFS=',' read -ra ADDRS <<< "$WG_ADDRESS"
-    for addr in "${ADDRS[@]}"; do
-        addr=$(echo "$addr" | xargs)
-        [ -n "$addr" ] && POSTUP_RULES+="ip address add $addr dev %i; " && POSTDOWN_RULES+="ip address del $addr dev %i; "
-    done
+# Add default routes to the custom VPN table (TABLE_ID) via the WireGuard interface.
+# This ensures traffic directed to TABLE_ID goes through the VPN.
+ip route add default dev \$1 table \$TABLE_ID
+ip -6 route add default dev \$1 table \$TABLE_ID
 
-    # Add default routes to the VPN table (TABLE_ID) via the WireGuard interface
-    # This ensures all traffic using TABLE_ID goes through the VPN interface.
-    POSTUP_RULES+="ip route add default dev %i table ${TABLE_ID}; "
-    POSTUP_RULES+="ip -6 route add default dev %i table ${TABLE_ID}; "
+# Add rules to direct *all* outbound traffic (not explicitly excluded) to the custom VPN table.
+# This rule should have a lower priority than rules for direct traffic.
+# The 'suppress_prefixlength 0' is key for locally originated traffic.
+ip rule add table \$TABLE_ID suppress_prefixlength 0 priority 100
 
-    # Add rules to direct *outbound* traffic originating from the server's main IPs to the VPN table.
-    # This ensures that traffic *from* the server goes out via VPN, but inbound is unaffected.
-    # The `suppress_prefixlength 0` rule makes this table the preferred default for locally originated traffic.
-    POSTUP_RULES+="ip rule add table ${TABLE_ID} suppress_prefixlength 0 priority 100; "
+# Rule to ensure SSH traffic (dport 22) always uses the main table (bypassing VPN).
+# This should have a higher priority than the general VPN outbound rule (100).
+ip rule add ipproto tcp dport 22 table main priority 50
+ip -6 rule add ipproto tcp dport 22 table main priority 50 2>/dev/null
 
-    if [ -n "$LAN6" ]; then
-        if [ "$WG_IPV6_TAKEOVER" == "y" ]; then
-            # If IPv6 takeover is 'y', then outbound IPv6 from LAN6 also goes via VPN table.
-            POSTUP_RULES+="ip -6 rule add table ${TABLE_ID} suppress_prefixlength 0 priority 100; "
-            info "已配置 WireGuard IPv6 接管原生出口。"
-        else
-            # If not taking over IPv6, then outbound IPv6 from LAN6 uses main table.
-            # So, we do not add a rule for LAN6 to TABLE_ID.
-            info "已配置保留原生 IPv6 出口。"
-        fi
-    fi
+# Rule to ensure traffic *from* the server's LAN IP (LAN4) uses the main table.
+# This is crucial for inbound services and direct outbound access from the server.
+# This rule needs a higher priority than the general VPN outbound rule (100).
+if [ -n "$LAN4" ]; then
+    ip rule add from $LAN4 table main priority 90
+fi
 
-    # Add a rule to ensure SSH (port 22) traffic from the server uses the main table.
-    # This is for outbound SSH connections initiated by the server, ensuring they bypass the VPN.
-    # For inbound SSH, existing routes should handle it as we are not overriding the main default route.
-    POSTUP_RULES+="ip rule add ipproto tcp dport 22 table main priority 50; "
+# Rule to ensure traffic *from* the server's LAN IPv6 (LAN6) uses the main table, if not taking over IPv6.
+if [ -n "$LAN6" ] && [ "$WG_IPV6_TAKEOVER" != "y" ]; then
+    ip -6 rule add from $LAN6 table main priority 90
+fi
+
+echo "\$(date): wg-up.sh completed." >> "$LOG_FILE"
+EOF
+    chmod +x "$WG_UP_SCRIPT"
+
+    # Generate wg-down.sh script
+    cat > "$WG_DOWN_SCRIPT" << EOF
+#!/bin/bash
+# WireGuard PostDown script for cleanup
+export PATH=\${PATH}:/usr/sbin:/usr/bin
+TABLE_ID=100
+
+echo "\$(date): wg-down.sh executing for device \$1. Cleaning up..." >> "$LOG_FILE"
+
+# Cleanup rules and routes added by wg-up.sh
+ip rule del table \$TABLE_ID suppress_prefixlength 0 priority 100 2>/dev/null
+ip -6 rule del table \$TABLE_ID suppress_prefixlength 0 priority 100 2>/dev/null
+ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
+ip -6 rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
+
+if [ -n "$LAN4" ]; then
+    ip rule del from $LAN4 table main priority 90 2>/dev/null
+fi
+
+if [ -n "$LAN6" ] && [ "$WG_IPV6_TAKEOVER" != "y" ]; then
+    ip -6 rule del from $LAN6 table main priority 90 2>/dev/null
+fi
+
+ip route flush table \$TABLE_ID 2>/dev/null
+
+echo "\$(date): wg-down.sh completed." >> "$LOG_FILE"
+EOF
+    chmod +x "$WG_DOWN_SCRIPT"
 
     # Write the wg0.conf file
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
+Address = ${WG_ADDRESS}
 DNS = ${WG_DNS}
-PostUp = ${POSTUP_RULES}
-PostDown = ${POSTDOWN_RULES}
+Table = off # Crucial: Prevent wg-quick from adding default routes to main table
+PostUp = ${WG_UP_SCRIPT} %i
+PostDown = ${WG_DOWN_SCRIPT} %i
 
 [Peer]
 PublicKey = ${PEER_PUBLIC_KEY}
 Endpoint = ${PEER_ENDPOINT}
-AllowedIPs = ${PEER_ALLOWED_IPS}
+AllowedIPs = ${PEER_ALLOWED_IPS} # Keep this for tunnel establishment, policy routing handles actual routing
 EOF
 
     [ -n "$PEER_PRESHARED_KEY" ] && echo "PresharedKey = ${PEER_PRESHARED_KEY}" >> /etc/wireguard/wg0.conf
     [ -n "$PEER_KEEPALIVE" ] && echo "PersistentKeepalive = ${PEER_KEEPALIVE}" >> /etc/wireguard/wg0.conf
 
     info "配置文件 /etc/wireguard/wg0.conf 已生成。"
+    info "WireGuard 启动/停止脚本已生成：${WG_UP_SCRIPT} 和 ${WG_DOWN_SCRIPT}"
     
     info "正在停止任何可能存在的 wg0 接口以确保环境干净..."
     systemctl stop wg-quick@wg0 >/dev/null 2>&1
@@ -314,15 +345,14 @@ wg_uninstall() {
     systemctl stop wg-quick@wg0 >/dev/null 2>&1
     systemctl disable wg-quick@wg0 >/dev/null 2>&1
     
-    # Clean up policy routing rules manually as wg-quick down might not always remove them perfectly
-    local TABLE_ID=100
-    ip rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null
-    ip -6 rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null
-    ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
-    ip route flush table ${TABLE_ID} 2>/dev/null
-    
-    info "正在删除配置文件..."
-    rm -f /etc/wireguard/wg0.conf
+    # Manually call down script to ensure all rules are removed
+    if [ -f "$WG_DOWN_SCRIPT" ]; then
+        info "正在执行 WireGuard down 脚本清理路由规则..."
+        "$WG_DOWN_SCRIPT" wg0 >/dev/null 2>&1
+    fi
+
+    info "正在删除配置文件和脚本..."
+    rm -f /etc/wireguard/wg0.conf "$WG_UP_SCRIPT" "$WG_DOWN_SCRIPT"
     
     if [ "$prompt" = "prompt" ]; then
         reading "是否要卸载 wireguard-tools 依赖包？[y/N]: " uninstall_deps
@@ -457,68 +487,91 @@ open_install() {
     # --- Start of UP script generation (MODIFIED for outbound-only) ---
     cat > "$OVPN_UP_SCRIPT" << EOF
 #!/bin/bash
-export PATH=\${PATH}:/usr/sbin
+export PATH=\${PATH}:/usr/sbin:/usr/bin
 TABLE_ID=100
 GW4=\${route_vpn_gateway}
 GW6=\${ifconfig_ipv6_remote}
 
-touch $LOG_FILE && chmod 644 $LOG_FILE
-echo "\$(date): up.sh executing for device \$dev" >> $LOG_FILE
+touch "$LOG_FILE" && chmod 644 "$LOG_FILE"
+echo "\$(date): up.sh executing for device \$dev" >> "$LOG_FILE"
 
 # Clear any previous rules for this table/priority before adding new ones
-ip rule del table \$TABLE_ID suppress_prefixlength 0 priority 100 2>/dev/null
-ip -6 rule del table \$TABLE_ID suppress_prefixlength 0 priority 100 2>/dev/null
+ip rule del from all table \$TABLE_ID priority 100 2>/dev/null
+ip -6 rule del from all table \$TABLE_ID priority 100 2>/dev/null
 ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
+ip -6 rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
 ip route flush table \$TABLE_ID 2>/dev/null # Clear routes in the custom table
+ip -6 route flush table \$TABLE_ID 2>/dev/null
 
 # --- IPv4 Routing ---
 if [ -n "\$GW4" ]; then
-    echo "\$(date): VPN IPv4 Gateway is \$GW4" >> $LOG_FILE
+    echo "\$(date): VPN IPv4 Gateway is \$GW4" >> "$LOG_FILE"
     # Add default route to the VPN table (TABLE_ID) via the VPN gateway
     ip route add default via \$GW4 dev \$dev table \$TABLE_ID
     # Add rule to direct *all* local outbound IPv4 traffic to the VPN table.
-    # This ensures outbound traffic from the server goes via VPN, but inbound is unaffected.
     ip rule add table \$TABLE_ID suppress_prefixlength 0 priority 100
 fi
 
 # --- IPv6 Routing (MODIFIED LOGIC for outbound-only) ---
 if [ -n "\$GW6" ]; then
     # Case 1: VPN provides a native IPv6 gateway.
-    echo "\$(date): VPN IPv6 Gateway is \$GW6" >> $LOG_FILE
+    echo "\$(date): VPN IPv6 Gateway is \$GW6" >> "$LOG_FILE"
     ip -6 route add default via \$GW6 dev \$dev table \$TABLE_ID
     # Add rule to direct *all* local outbound IPv6 traffic to the VPN table.
-    # This ensures outbound traffic from the server goes via VPN, but inbound is unaffected.
     ip -6 rule add table \$TABLE_ID suppress_prefixlength 0 priority 100
 else
     # Case 2: VPN does NOT provide an IPv6 gateway.
     # Route all IPv6 egress via the VPN interface, to be encapsulated over IPv4.
-    echo "\$(date): No VPN IPv6 Gateway. Routing all IPv6 egress via VPN interface \$dev (encapsulated)." >> $LOG_FILE
+    echo "\$(date): No VPN IPv6 Gateway. Routing all IPv6 egress via VPN interface \$dev (encapsulated)." >> "$LOG_FILE"
     ip -6 route add default dev \$dev table \$TABLE_ID
     # Add rule to direct *all* local outbound IPv6 traffic to the VPN table.
     ip -6 rule add table \$TABLE_ID suppress_prefixlength 0 priority 100
 fi
 
-# Add a rule to ensure SSH (port 22) traffic from the server uses the main table.
-# This is for outbound SSH connections initiated by the server, ensuring they bypass the VPN.
-# For inbound SSH, existing routes should handle it as we are not overriding the main default route.
+# Add a rule to ensure SSH (port 22) traffic always uses the main table.
+# This is for both inbound and outbound SSH connections.
 ip rule add ipproto tcp dport 22 table main priority 50
+ip -6 rule add ipproto tcp dport 22 table main priority 50 2>/dev/null
+
+# Rule to ensure traffic *from* the server's LAN IP (LAN4) uses the main table.
+if [ -n "$LAN4" ]; then
+    ip rule add from $LAN4 table main priority 90
+fi
+
+# Rule to ensure traffic *from* the server's LAN IPv6 (LAN6) uses the main table, if not taking over IPv6.
+if [ -n "$LAN6" ] && [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
+    ip -6 rule add from $LAN6 table main priority 90
+fi
+
+echo "\$(date): up.sh completed." >> "$LOG_FILE"
 EOF
     # --- End of UP script generation ---
 
     # --- Start of DOWN script generation (MODIFIED for outbound-only) ---
     cat > "$OVPN_DOWN_SCRIPT" << EOF
 #!/bin/bash
-export PATH=\${PATH}:/usr/sbin
+export PATH=\${PATH}:/usr/sbin:/usr/bin
 TABLE_ID=100
-echo "\$(date): down.sh executing for device \$dev. Cleaning up..." >> $LOG_FILE
+echo "\$(date): down.sh executing for device \$dev. Cleaning up..." >> "$LOG_FILE"
 
 # Cleanup IPv4 and IPv6 rules added by up.sh
 ip rule del table \$TABLE_ID suppress_prefixlength 0 priority 100 2>/dev/null
 ip -6 rule del table \$TABLE_ID suppress_prefixlength 0 priority 100 2>/dev/null
 ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
-ip route flush table \$TABLE_ID 2>/dev/null
+ip -6 rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
 
-echo "\$(date): Cleanup complete." >> $LOG_FILE
+if [ -n "$LAN4" ]; then
+    ip rule del from $LAN4 table main priority 90 2>/dev/null
+fi
+
+if [ -n "$LAN6" ] && [ "$OVPN_IPV6_TAKEOVER" != "y" ]; then
+    ip -6 rule del from $LAN6 table main priority 90 2>/dev/null
+fi
+
+ip route flush table \$TABLE_ID 2>/dev/null
+ip -6 route flush table \$TABLE_ID 2>/dev/null
+
+echo "\$(date): Cleanup complete." >> "$LOG_FILE"
 EOF
     # --- End of DOWN script generation ---
 
@@ -566,12 +619,11 @@ open_uninstall() {
     systemctl stop "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
     systemctl disable "openvpn-client@${OVPN_CONFIG_NAME%.*}" >/dev/null 2>&1
     
-    # Clean up policy routing rules manually as down script might not always remove them perfectly
-    local TABLE_ID=100
-    ip rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null
-    ip -6 rule del table ${TABLE_ID} suppress_prefixlength 0 priority 100 2>/dev/null
-    ip rule del ipproto tcp dport 22 table main priority 50 2>/dev/null
-    ip route flush table ${TABLE_ID} 2>/dev/null
+    # Manually call down script to ensure all rules are removed
+    if [ -f "$OVPN_DOWN_SCRIPT" ]; then
+        info "正在执行 OpenVPN down 脚本清理路由规则..."
+        "$OVPN_DOWN_SCRIPT" >/dev/null 2>&1
+    fi
 
     info "正在删除配置文件和脚本..."
     rm -rf "$OVPN_CONFIG_DIR" "$OVPN_AUTH_FILE" "$OVPN_UP_SCRIPT" "$OVPN_DOWN_SCRIPT"
@@ -683,7 +735,7 @@ open_menu() {
 main_menu() {
     clear
     echo "=============================================="
-    echo "      通用 VPN 智能路由管理脚本 v2.3"
+    echo "      通用 VPN 智能路由管理脚本 v2.4"
     echo "=============================================="
     info "当前活动服务:"
     if systemctl is-active --quiet wg-quick@wg0; then
